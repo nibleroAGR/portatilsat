@@ -236,12 +236,13 @@
         }
         const ENCRYPTED_SINGLE_DOCS = ['transporte', 'incidencias', 'incidencias_historial', 'rma_tracking', 'rma_historial', 'rma_contabilidad', 'user_roles'];
 
-        window._fbCryptoChange = async (currentPass, newPass, remember, onProgress) => {
+        const cryptoChangeImpl = async (currentPass, newPass, remember, onProgress, ph) => {
             if (!cryptoSupported()) throw new Error('nocrypto');
             if (!cryptoKeys) throw new Error('locked');
             const progress = (m) => { try { if (onProgress) onProgress(m); } catch (e) {} };
 
             /* 1) Comprobar la clave actual */
+            ph.v = 'comprobar la clave actual';
             progress('Comprobando la clave actual…');
             const snap0 = await getDoc(cryptoRef());
             if (!snap0.exists()) throw new Error('nosetup');
@@ -263,6 +264,7 @@
 
             /* 3) Delegaciones: descifrar con la clave antigua y preparar las copias nuevas */
             progress('Recifrando delegaciones…');
+            ph.v = 'leer delegaciones';
             const delegSnap = await getDocs(collection(db, 'delegaciones'));
             const newDelegOps = [];      // escrituras de los documentos nuevos
             const newDelegRefs = [];     // para poder deshacer si algo falla
@@ -291,6 +293,7 @@
                 try { await commitInChunks(newDelegRefs.map(r => (b) => b.delete(r))); } catch (e) {}
             };
 
+            ph.v = 'escribir delegaciones nuevas';
             try {
                 await commitInChunks(newDelegOps);
             } catch (e) {
@@ -300,6 +303,7 @@
 
             /* 4) Transacción: reescribir todos los documentos de datos y la clave */
             progress('Recifrando el resto de datos…');
+            ph.v = 'transacción (documentos de datos y config/crypto)';
             const prevKeys = cryptoKeys, prevSalt = currentSalt;
             const targets = ENCRYPTED_SINGLE_DOCS.map(c => ({ ref: doc(db, c, 'entries'), aad: c + '/entries' }));
             try {
@@ -344,6 +348,16 @@
             if (remember) rememberMaster(newSalt, newMaster);
 
             return { skipped, cleanupFailed };
+        };
+
+        window._fbCryptoChange = async (currentPass, newPass, remember, onProgress) => {
+            const ph = { v: 'inicio' };
+            try {
+                return await cryptoChangeImpl(currentPass, newPass, remember, onProgress, ph);
+            } catch (e) {
+                try { if (e && typeof e === 'object') e.phase = ph.v; } catch (_) {}
+                throw e;
+            }
         };
 
         /* Avisa si OTRO equipo cambia la clave mientras esta sesión está abierta: seguir
@@ -1079,6 +1093,7 @@
         }
         .rma-crono-time { font-family: monospace; font-weight: 700; flex: 1; word-break: break-all; }
         .rma-crono-time.paused { color: var(--secondary-color); }
+        .rma-card-espera { margin-top: 5px; font-size: 0.72rem; font-weight: 700; color: var(--warning-color); word-break: break-word; }
 
         /* Buscador del tablero de Seguimiento RMA */
         .rma-search-wrap { position: relative; display: flex; align-items: center; gap: 10px; margin-bottom: 10px; width: 100%; }
@@ -1940,12 +1955,40 @@
                         <span>Test Extensivo <span style="font-weight:400; color:var(--secondary-color); font-size:0.8rem;">(pausa el cronómetro mientras esté en Pretest)</span></span>
                     </label>
                 </div>
+                <div id="rma-info-espera-row" class="rma-info-garantia-row" style="display:none;">
+                    <label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-weight:400;">
+                        <input type="checkbox" id="rma-info-espera-check" onchange="rmaInfoToggleEspera()">
+                        <span id="rma-info-espera-label">En espera de…</span>
+                    </label>
+                </div>
                 <div id="rma-info-empty" class="inc-no-updates">Todavía no hay información registrada.</div>
                 <div id="rma-info-list" class="inc-updates"></div>
                 <div class="inc-add-update" style="margin-top:12px; border-top:2px dashed var(--border-color); padding-top:14px;">
                     <input type="date" id="rma-info-add-date" value="">
                     <textarea id="rma-info-add-text" rows="2" placeholder="Escribe información sobre este RMA..."></textarea>
                     <button id="rma-info-add-btn" class="inc-add-update-btn"><i class="fas fa-plus"></i> Añadir</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ══════════════════════════════════════════
+         "EN ESPERA DE…" (Final Test): motivo obligatorio, pausa el cronómetro
+    ══════════════════════════════════════════ -->
+    <div id="rma-espera-modal-overlay" class="modal-overlay">
+        <div class="modal-box">
+            <div class="modal-header">
+                <h2><i class="fas fa-hourglass-half"></i> En espera de…</h2>
+                <button id="rma-espera-close-btn" class="modal-close-btn" title="Cerrar"><i class="fas fa-times"></i></button>
+            </div>
+            <div class="modal-body">
+                <p style="margin:0 0 10px; color: var(--secondary-color); font-size: 0.9rem;">
+                    Indica de qué está en espera el RMA <strong id="rma-espera-title"></strong>. Es obligatorio y el cronómetro quedará pausado hasta que desmarques la casilla.
+                </p>
+                <textarea id="rma-espera-text" rows="3" placeholder="Ej.: pieza, aprobación del cliente..."></textarea>
+                <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:12px;">
+                    <button id="rma-espera-cancel-btn" class="inc-add-update-btn" style="background: var(--secondary-color);">Cancelar</button>
+                    <button id="rma-espera-confirm-btn" class="inc-add-update-btn"><i class="fas fa-check"></i> Confirmar</button>
                 </div>
             </div>
         </div>
@@ -2372,6 +2415,15 @@ document.addEventListener('DOMContentLoaded', () => {
     const rmaInfoGarantiaFBtn = document.getElementById('rma-info-garantia-f');
     const rmaInfoExtensivoRow   = document.getElementById('rma-info-extensivo-row');
     const rmaInfoExtensivoCheck = document.getElementById('rma-info-extensivo-check');
+    const rmaInfoEsperaRow      = document.getElementById('rma-info-espera-row');
+    const rmaInfoEsperaCheck    = document.getElementById('rma-info-espera-check');
+    const rmaInfoEsperaLabel    = document.getElementById('rma-info-espera-label');
+    const rmaEsperaModalOverlay = document.getElementById('rma-espera-modal-overlay');
+    const rmaEsperaCloseBtn     = document.getElementById('rma-espera-close-btn');
+    const rmaEsperaCancelBtn    = document.getElementById('rma-espera-cancel-btn');
+    const rmaEsperaConfirmBtn   = document.getElementById('rma-espera-confirm-btn');
+    const rmaEsperaTitleEl      = document.getElementById('rma-espera-title');
+    const rmaEsperaTextEl       = document.getElementById('rma-espera-text');
 
     const rmaGarantiaModalOverlay = document.getElementById('rma-garantia-modal-overlay');
     const rmaGarantiaCloseBtn     = document.getElementById('rma-garantia-close-btn');
@@ -3698,6 +3750,8 @@ document.addEventListener('DOMContentLoaded', () => {
         /* El check "Test Extensivo" solo tiene sentido en Pretest: si el RMA ya no está
            en esa fase (p. ej. se restauró desde datos antiguos), se desmarca. */
         if (entry.fase !== 'Pretest') entry.testExtensivo = false;
+        /* "En espera de…" (motivo) solo existe en Final Test */
+        if (typeof entry.esperaMotivo !== 'string' || !entry.esperaMotivo.trim() || entry.fase !== 'Final Test') entry.esperaMotivo = null;
         if (!entry.cronometro || typeof entry.cronometro !== 'object') {
             /* RMAs ya existentes que no tenían cronómetro: se crea arrancado desde ahora
                (pausado si ya está "En espera" o todavía "Pendiente Recibir") */
@@ -3714,6 +3768,12 @@ document.addEventListener('DOMContentLoaded', () => {
                 entry.cronometro.running = false;
                 entry.cronometro.startedAt = null;
             }
+        }
+        /* Con "En espera de…" activo el cronómetro siempre debe estar pausado */
+        if (entry.esperaMotivo && entry.cronometro.running) {
+            entry.cronometro.accumulatedMs += (Date.now() - (entry.cronometro.startedAt || Date.now()));
+            entry.cronometro.running = false;
+            entry.cronometro.startedAt = null;
         }
         return entry;
     }
@@ -3832,7 +3892,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!value) return;
         rmaTracking.push({
             id: genId('rma'), rma: value, fase: 'Pendiente Recibir', fecha: nowStr(), usuario: currentUserEmail,
-            info: [], testExtensivo: false, cronometro: { running: false, accumulatedMs: 0, startedAt: null }
+            info: [], testExtensivo: false, esperaMotivo: null, cronometro: { running: false, accumulatedMs: 0, startedAt: null }
         });
         await saveRmaTracking();
         await addRmaHistorial(value, 'Pendiente Recibir', currentUserEmail);
@@ -3955,6 +4015,82 @@ document.addEventListener('DOMContentLoaded', () => {
         showNotification(activar ? 'Test Extensivo activado: cronómetro pausado' : 'Test Extensivo desactivado: cronómetro reanudado');
     };
 
+    /* Check "En espera de…" (solo en fase Final Test):
+       - Al marcarlo se pide el motivo (obligatorio) y se pausa el cronómetro.
+       - Al desmarcarlo el cronómetro continúa donde se quedó.
+       - Si el RMA cambia de fase se quita solo (ver doRmaMovePhase). */
+    window.rmaInfoToggleEspera = async function() {
+        if (!rmaInfoCurrentId) return;
+        const idx = rmaFindIndex(rmaInfoCurrentId);
+        if (idx === -1) return;
+        const entry = rmaTracking[idx];
+        if (entry.fase !== 'Final Test') { renderRmaInfo(); return; }
+
+        if (!entry.esperaMotivo) {
+            /* Marcar: primero se pide el motivo; hasta confirmar no cambia nada */
+            renderRmaInfo();
+            openRmaEsperaModal(entry.id);
+            return;
+        }
+
+        /* Desmarcar: se registra en Info y se reanuda el cronómetro */
+        if (!Array.isArray(entry.info)) entry.info = [];
+        entry.info.push({ id: genId('rmainfo'), fecha: todayISO(), texto: `Deja de estar en espera de: ${entry.esperaMotivo}. Cronómetro reanudado.`, usuario: currentUserEmail });
+        entry.esperaMotivo = null;
+        if (!entry.cronometro || typeof entry.cronometro !== 'object') entry.cronometro = { running: false, accumulatedMs: 0, startedAt: null };
+        if (!entry.cronometro.running) { entry.cronometro.running = true; entry.cronometro.startedAt = Date.now(); }
+        await saveRmaTracking();
+        renderRmaTracking();
+        renderRmaInfo();
+        showNotification('Ya no está en espera: cronómetro reanudado');
+    };
+
+    let rmaEsperaPendingId = null;
+    function openRmaEsperaModal(id) {
+        const entry = rmaTracking.find(e => e.id === id);
+        if (!entry) return;
+        rmaEsperaPendingId = id;
+        rmaEsperaTitleEl.textContent = entry.rma || '';
+        rmaEsperaTextEl.value = '';
+        rmaEsperaModalOverlay.classList.add('show');
+        setTimeout(() => rmaEsperaTextEl.focus(), 50);
+    }
+    function closeRmaEsperaModal() {
+        rmaEsperaModalOverlay.classList.remove('show');
+        rmaEsperaPendingId = null;
+        rmaEsperaTextEl.value = '';
+        if (rmaInfoCurrentId) renderRmaInfo();   // deja la casilla como estaba
+    }
+    rmaEsperaConfirmBtn.addEventListener('click', async () => {
+        const motivo = rmaEsperaTextEl.value.trim();
+        if (!motivo) { showNotification('Indica de qué está en espera antes de continuar'); rmaEsperaTextEl.focus(); return; }
+        const idx = rmaFindIndex(rmaEsperaPendingId);
+        rmaEsperaModalOverlay.classList.remove('show');
+        rmaEsperaPendingId = null;
+        rmaEsperaTextEl.value = '';
+        if (idx === -1) return;
+        const entry = rmaTracking[idx];
+        if (entry.fase !== 'Final Test') { if (rmaInfoCurrentId) renderRmaInfo(); return; }
+        entry.esperaMotivo = motivo;
+        if (!Array.isArray(entry.info)) entry.info = [];
+        entry.info.push({ id: genId('rmainfo'), fecha: todayISO(), texto: `En espera de: ${motivo}. Cronómetro pausado.`, usuario: currentUserEmail });
+        if (!entry.cronometro || typeof entry.cronometro !== 'object') entry.cronometro = { running: false, accumulatedMs: 0, startedAt: null };
+        const c = entry.cronometro;
+        if (c.running) {
+            c.accumulatedMs = rmaCronoElapsedMs(entry);
+            c.running = false;
+            c.startedAt = null;
+        }
+        await saveRmaTracking();
+        renderRmaTracking();
+        if (rmaInfoCurrentId) renderRmaInfo();
+        showNotification('En espera de: ' + motivo + ' — cronómetro pausado');
+    });
+    rmaEsperaCancelBtn.addEventListener('click', closeRmaEsperaModal);
+    rmaEsperaCloseBtn.addEventListener('click', closeRmaEsperaModal);
+    rmaEsperaModalOverlay.addEventListener('click', (e) => { if (e.target === rmaEsperaModalOverlay) closeRmaEsperaModal(); });
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && rmaEsperaModalOverlay.classList.contains('show')) closeRmaEsperaModal(); });
+
     async function doRmaMovePhase(id, newPhase, motivo) {
         const idx = rmaTracking.findIndex(e => e.id === id);
         if (idx === -1) return;
@@ -3981,6 +4117,7 @@ document.addEventListener('DOMContentLoaded', () => {
            solo aplica mientras el RMA está en Pretest. El cronómetro pasa a depender
            únicamente de la nueva fase (bloque siguiente). */
         rmaTracking[idx].testExtensivo = false;
+        rmaTracking[idx].esperaMotivo = null;   /* "En espera de…" solo aplica en Final Test */
 
         /* Cronómetro automático según fase: en "En espera" se pausa, en el resto continúa/se reanuda */
         const entry = rmaTracking[idx];
@@ -4143,6 +4280,9 @@ document.addEventListener('DOMContentLoaded', () => {
                 <i class="fas fa-stopwatch"></i>
                 <span class="rma-crono-time${isRunning ? '' : ' paused'}" data-id="${entry.id}">${esc(rmaCronoFormat(rmaCronoElapsedMs(entry)))}</span>${extensivoBadge}
             </div>`;
+        const esperaHtml = (entry.fase === 'Final Test' && entry.esperaMotivo)
+            ? `<div class="rma-card-espera" title="En espera de ${esc(entry.esperaMotivo)}"><i class="fas fa-pause"></i> En espera de ${esc(entry.esperaMotivo)}</div>`
+            : '';
         const garantiaDot = entry.garantia === 'G'
             ? '<span class="rma-garantia-dot g" title="En garantía"></span>'
             : entry.garantia === 'F'
@@ -4156,6 +4296,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 </div>
                 <div class="rma-card-actions">${actions}${infoBtn}</div>
                 ${cronoHtml}
+                ${esperaHtml}
             </div>`;
     }
 
@@ -4227,6 +4368,18 @@ document.addEventListener('DOMContentLoaded', () => {
         } else {
             rmaInfoExtensivoRow.style.display = 'none';
             rmaInfoExtensivoCheck.checked = false;
+        }
+
+        /* El check "En espera de…" solo se muestra mientras el RMA está en Final Test */
+        if (entry.fase === 'Final Test') {
+            rmaInfoEsperaRow.style.display = 'block';
+            rmaInfoEsperaCheck.checked = !!entry.esperaMotivo;
+            rmaInfoEsperaLabel.innerHTML = entry.esperaMotivo
+                ? `En espera de ${esc(entry.esperaMotivo)} <span style="font-weight:400; color:var(--secondary-color); font-size:0.8rem;">(cronómetro pausado)</span>`
+                : `En espera de… <span style="font-weight:400; color:var(--secondary-color); font-size:0.8rem;">(pide el motivo y pausa el cronómetro)</span>`;
+        } else {
+            rmaInfoEsperaRow.style.display = 'none';
+            rmaInfoEsperaCheck.checked = false;
         }
 
         const notes = (entry.info || []).slice().sort((a, b) => (a.fecha < b.fecha ? 1 : -1));
@@ -5865,7 +6018,11 @@ document.addEventListener('DOMContentLoaded', () => {
             else if (m === 'changed')   setCryptoStatus('La clave ha sido cambiada desde otro equipo mientras tanto. Vuelve a iniciar sesión.', 'error');
             else if (m === 'nocrypto')  setCryptoStatus('Este navegador no permite el cifrado necesario', 'error');
             else if (m === 'locked')    setCryptoStatus('La clave de cifrado no está desbloqueada en esta sesión', 'error');
-            else { console.error(e); setCryptoStatus('No se pudo cambiar la clave. Los datos no se han modificado; inténtalo de nuevo.', 'error'); }
+            else {
+                console.error('Error al cambiar la clave de cifrado:', e);
+                const detalle = [e && e.phase ? 'paso: ' + e.phase : '', e && e.code ? 'código: ' + e.code : '', e && e.message ? e.message : ''].filter(Boolean).join(' · ');
+                setCryptoStatus('No se pudo cambiar la clave. Los datos no se han modificado. Detalle → ' + detalle, 'error');
+            }
         }
         keyChangeBusy = false;
         keyConfirmBtn.disabled = false; keyCancelBtn.disabled = false; changeKeyBtn.disabled = false;
