@@ -53,52 +53,219 @@
             await signOut(secondaryAuth);
         };
 
+        /* ══════════════════════════════════════════════════════════════
+           CIFRADO DE DATOS (en el navegador, antes de enviar a Firebase)
+           - Clave: PBKDF2-SHA256 (600.000 iteraciones) sobre la clave de cifrado + sal.
+           - De la clave maestra se derivan (HKDF) una clave AES-256-GCM para los datos
+             y una clave HMAC-SHA256 para generar IDs de documento opacos.
+           - Cada documento se guarda como { enc:1, z, iv, ct } (ct = JSON cifrado,
+             comprimido con gzip si el navegador lo permite). El "path" del documento
+             va como dato autenticado (AAD): un bloque cifrado no se puede copiar a otro
+             documento sin que falle la verificación.
+           La clave NUNCA se guarda en Firebase.
+        ══════════════════════════════════════════════════════════════ */
+        /*CRYPTO-CORE-START*/
+        const PBKDF2_ITERATIONS = 600000;
+        const _te = new TextEncoder();
+        const _td = new TextDecoder();
+        let cryptoKeys = null;   // { aes, hmac } — solo en memoria
+
+        function b64enc(bytes) {
+            let s = '';
+            for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+            return btoa(s);
+        }
+        function b64dec(str) {
+            const s = atob(str);
+            const out = new Uint8Array(s.length);
+            for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
+            return out;
+        }
+        function cryptoSupported() {
+            return !!(window.crypto && window.crypto.subtle);
+        }
+        async function pipeBytes(bytes, stream) {
+            const w = stream.writable.getWriter();
+            w.write(bytes).catch(() => {});
+            w.close().catch(() => {});
+            return new Uint8Array(await new Response(stream.readable).arrayBuffer());
+        }
+        async function deriveMaster(passphrase, saltBytes) {
+            const base = await crypto.subtle.importKey('raw', _te.encode(String(passphrase).normalize('NFKC')), 'PBKDF2', false, ['deriveBits']);
+            return new Uint8Array(await crypto.subtle.deriveBits(
+                { name: 'PBKDF2', salt: saltBytes, iterations: PBKDF2_ITERATIONS, hash: 'SHA-256' }, base, 256));
+        }
+        async function keysFromMaster(master) {
+            const hk = await crypto.subtle.importKey('raw', master, 'HKDF', false, ['deriveKey']);
+            const salt = new Uint8Array(0);
+            const aes = await crypto.subtle.deriveKey(
+                { name: 'HKDF', hash: 'SHA-256', salt, info: _te.encode('portatilsat-aes-v1') },
+                hk, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+            const hmac = await crypto.subtle.deriveKey(
+                { name: 'HKDF', hash: 'SHA-256', salt, info: _te.encode('portatilsat-hmac-v1') },
+                hk, { name: 'HMAC', hash: 'SHA-256', length: 256 }, false, ['sign']);
+            return { aes, hmac };
+        }
+        async function encryptWith(keys, obj, aad) {
+            let bytes = _te.encode(JSON.stringify(obj));
+            let z = 0;
+            if (bytes.length > 256 && typeof CompressionStream !== 'undefined') {
+                try { bytes = await pipeBytes(bytes, new CompressionStream('gzip')); z = 1; } catch (e) { bytes = _te.encode(JSON.stringify(obj)); z = 0; }
+            }
+            const iv = crypto.getRandomValues(new Uint8Array(12));
+            const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: _te.encode(aad) }, keys.aes, bytes);
+            return { enc: 1, z, iv: b64enc(iv), ct: b64enc(new Uint8Array(ct)) };
+        }
+        async function decryptWith(keys, payload, aad) {
+            let bytes = new Uint8Array(await crypto.subtle.decrypt(
+                { name: 'AES-GCM', iv: b64dec(payload.iv), additionalData: _te.encode(aad) }, keys.aes, b64dec(payload.ct)));
+            if (payload.z === 1) bytes = await pipeBytes(bytes, new DecompressionStream('gzip'));
+            return JSON.parse(_td.decode(bytes));
+        }
+        function isEncrypted(data) {
+            return !!(data && data.enc === 1 && typeof data.ct === 'string' && typeof data.iv === 'string');
+        }
+        function requireKeys() {
+            if (!cryptoKeys) throw new Error('Clave de cifrado no disponible');
+            return cryptoKeys;
+        }
+        const encodeDoc = (obj, aad) => encryptWith(requireKeys(), obj, aad);
+        /* Si el documento aún está en claro (datos anteriores al cifrado) se devuelve tal cual;
+           se cifrará la próxima vez que se guarde. */
+        const decodeDoc = async (data, aad) => isEncrypted(data) ? decryptWith(requireKeys(), data, aad) : data;
+        async function blindId(text) {
+            const sig = await crypto.subtle.sign('HMAC', requireKeys().hmac, _te.encode(text));
+            return Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+        }
+        /*CRYPTO-CORE-END*/
+
+        const CRYPTO_CHECK_AAD = 'config/crypto';
+        const REMEMBER_KEY = 'enc_key_v1';
+        const cryptoRef = () => doc(db, 'config', 'crypto');
+
+        function rememberMaster(saltB64, master) {
+            try { localStorage.setItem(REMEMBER_KEY, JSON.stringify({ salt: saltB64, master: b64enc(master) })); } catch (e) {}
+        }
+
+        window._fbCryptoSupported = cryptoSupported;
+        window._fbCryptoReady = () => !!cryptoKeys;
+        window._fbCryptoLock = () => { cryptoKeys = null; };
+        window._fbCryptoRemembered = () => { try { return !!localStorage.getItem(REMEMBER_KEY); } catch (e) { return false; } };
+        window._fbCryptoForget = () => { try { localStorage.removeItem(REMEMBER_KEY); } catch (e) {} };
+
+        /* ¿Existe ya la clave de cifrado en este proyecto? (config/crypto guarda solo la sal
+           —dato público— y una comprobación cifrada para validar la clave; nunca la clave) */
+        window._fbCryptoStatus = async () => {
+            const snap = await getDoc(cryptoRef());
+            return { exists: snap.exists() };
+        };
+
+        window._fbCryptoSetup = async (passphrase, remember) => {
+            if (!cryptoSupported()) throw new Error('nocrypto');
+            const salt = crypto.getRandomValues(new Uint8Array(16));
+            const master = await deriveMaster(passphrase, salt);
+            const keys = await keysFromMaster(master);
+            const check = await encryptWith(keys, { ok: true, t: Date.now() }, CRYPTO_CHECK_AAD);
+            const saltB64 = b64enc(salt);
+            await runTransaction(db, async (tx) => {
+                const snap = await tx.get(cryptoRef());
+                if (snap.exists()) throw new Error('exists');
+                tx.set(cryptoRef(), { salt: saltB64, check });
+            });
+            cryptoKeys = keys;
+            if (remember) rememberMaster(saltB64, master);
+        };
+
+        window._fbCryptoUnlock = async (passphrase, remember) => {
+            if (!cryptoSupported()) throw new Error('nocrypto');
+            const snap = await getDoc(cryptoRef());
+            if (!snap.exists()) throw new Error('nosetup');
+            const { salt, check } = snap.data();
+            const master = await deriveMaster(passphrase, b64dec(salt));
+            const keys = await keysFromMaster(master);
+            try {
+                const r = await decryptWith(keys, check, CRYPTO_CHECK_AAD);
+                if (!r || r.ok !== true) throw new Error('bad');
+            } catch (e) { throw new Error('wrong'); }
+            cryptoKeys = keys;
+            if (remember) rememberMaster(salt, master);
+        };
+
+        window._fbCryptoTryRemembered = async () => {
+            if (!cryptoSupported()) return false;
+            let saved = null;
+            try { saved = JSON.parse(localStorage.getItem(REMEMBER_KEY)); } catch (e) {}
+            if (!saved || !saved.master) return false;
+            let snap;
+            try { snap = await getDoc(cryptoRef()); } catch (e) { return false; }
+            if (!snap.exists() || snap.data().salt !== saved.salt) { window._fbCryptoForget(); return false; }
+            try {
+                const keys = await keysFromMaster(b64dec(saved.master));
+                const r = await decryptWith(keys, snap.data().check, CRYPTO_CHECK_AAD);
+                if (!r || r.ok !== true) throw new Error('bad');
+                cryptoKeys = keys;
+                return true;
+            } catch (e) { window._fbCryptoForget(); return false; }
+        };
+
+        /* ── DELEGACIONES: el ID del documento es un HMAC del teléfono (no el teléfono) y
+           el teléfono + la delegación viajan dentro del contenido cifrado ── */
+        const delegKeyOf = (phone) => String(phone || '').replace(/\D/g, '');
+        async function delegRef(key) { return doc(db, 'delegaciones', await blindId('delegacion:' + key)); }
+
         window._fbGetDelegacion = async (phone) => {
             if (!phone || phone === 'N/A') return null;
-            const key = phone.replace(/\D/g, '');
+            const key = delegKeyOf(phone);
             if (!key) return null;
             try {
-                const snap = await getDoc(doc(db, 'delegaciones', key));
-                return snap.exists() ? snap.data().delegacion : null;
+                const ref = await delegRef(key);
+                const snap = await getDoc(ref);
+                if (!snap.exists()) return null;
+                const d = await decodeDoc(snap.data(), 'delegaciones/' + ref.id);
+                return (d && d.delegacion) || null;
             } catch (e) {
                 console.error('Firebase get error:', e);
                 return null;
             }
         };
 
+        /* Versiones "estrictas" (lanzan el error) para la ventana de gestión de delegaciones */
+        window._fbSetDelegacionStrict = async (phone, delegacion) => {
+            const key = delegKeyOf(phone);
+            if (!key) throw new Error('Teléfono no válido');
+            const ref = await delegRef(key);
+            await setDoc(ref, await encodeDoc({ delegacion, phone }, 'delegaciones/' + ref.id));
+        };
+
+        window._fbDeleteDelegacion = async (phone) => {
+            const key = delegKeyOf(phone);
+            if (!key) return;
+            await deleteDoc(await delegRef(key));
+        };
+
         window._fbSetDelegacion = async (phone, delegacion) => {
             if (!phone || phone === 'N/A') return;
-            const key = phone.replace(/\D/g, '');
-            if (!key) return;
+            if (!delegKeyOf(phone)) return;
             try {
-                await setDoc(doc(db, 'delegaciones', key), { delegacion, phone });
+                await window._fbSetDelegacionStrict(phone, delegacion);
             } catch (e) {
                 console.error('Firebase set error:', e);
             }
         };
 
-        /* Versiones "estrictas" (lanzan el error) para la ventana de gestión de delegaciones */
-        window._fbSetDelegacionStrict = async (phone, delegacion) => {
-            const key = String(phone || '').replace(/\D/g, '');
-            if (!key) throw new Error('Teléfono no válido');
-            await setDoc(doc(db, 'delegaciones', key), { delegacion, phone });
-        };
-
-        window._fbDeleteDelegacion = async (phone) => {
-            const key = String(phone || '').replace(/\D/g, '');
-            if (!key) return;
-            await deleteDoc(doc(db, 'delegaciones', key));
-        };
-
         window._fbGetAllDelegaciones = async () => {
             try {
                 const snap = await getDocs(collection(db, 'delegaciones'));
-                const rows = [];
-                snap.forEach((d) => {
-                    const data = d.data() || {};
-                    rows.push({ phone: data.phone || d.id, delegacion: data.delegacion || null });
-                });
-                return rows;
+                const rows = await Promise.all(snap.docs.map(async (d) => {
+                    try {
+                        const data = (await decodeDoc(d.data(), 'delegaciones/' + d.id)) || {};
+                        return { phone: data.phone || '', delegacion: data.delegacion || null };
+                    } catch (e) {
+                        console.error('No se pudo descifrar una delegación:', e);
+                        return null;
+                    }
+                }));
+                return rows.filter(r => r && r.phone);
             } catch (e) {
                 console.error('Firebase get all delegaciones error:', e);
                 return [];
@@ -108,11 +275,12 @@
         window._fbSetAllDelegaciones = async (rows) => {
             try {
                 const batch = writeBatch(db);
-                (rows || []).forEach((r) => {
-                    const key = String(r.phone || '').replace(/\D/g, '');
-                    if (!key) return;
-                    batch.set(doc(db, 'delegaciones', key), { delegacion: r.delegacion, phone: r.phone });
-                });
+                for (const r of (rows || [])) {
+                    const key = delegKeyOf(r.phone);
+                    if (!key) continue;
+                    const ref = await delegRef(key);
+                    batch.set(ref, await encodeDoc({ delegacion: r.delegacion, phone: r.phone }, 'delegaciones/' + ref.id));
+                }
                 await batch.commit();
             } catch (e) {
                 console.error('Firebase set all delegaciones error:', e);
@@ -120,24 +288,57 @@
             }
         };
 
-        /* ── TRANSPORTE Firebase ── */
-        window._fbGetTransporte = async () => {
+        /* ── Documentos de tipo lista { rows } (siempre en <colección>/entries, cifrados) ── */
+        const rowsGet = (col, label) => async () => {
             try {
-                const snap = await getDoc(doc(db, 'transporte', 'entries'));
-                return snap.exists() ? (snap.data().rows || []) : [];
+                const snap = await getDoc(doc(db, col, 'entries'));
+                if (!snap.exists()) return [];
+                const d = await decodeDoc(snap.data(), col + '/entries');
+                return (d && d.rows) || [];
             } catch (e) {
-                console.error('Firebase get transporte error:', e);
+                console.error(`Firebase get ${label} error:`, e);
                 return [];
             }
         };
-
-        window._fbSetTransporte = async (rows) => {
+        const rowsSet = (col, label) => async (rows) => {
             try {
-                await setDoc(doc(db, 'transporte', 'entries'), { rows });
+                await setDoc(doc(db, col, 'entries'), await encodeDoc({ rows }, col + '/entries'));
             } catch (e) {
-                console.error('Firebase set transporte error:', e);
+                console.error(`Firebase set ${label} error:`, e);
             }
         };
+        /* Escucha en tiempo real: cada cambio se descifra antes de entregarlo. Si llegan dos
+           cambios seguidos, solo se entrega el más reciente (se descartan resultados atrasados). */
+        const rowsListen = (col, label) => (onChange, onError) => {
+            try {
+                let seq = 0;
+                return onSnapshot(doc(db, col, 'entries'), async (snap) => {
+                    const mine = ++seq;
+                    try {
+                        let rows = [];
+                        if (snap.exists()) {
+                            const d = await decodeDoc(snap.data(), col + '/entries');
+                            rows = (d && d.rows) || [];
+                        }
+                        if (mine === seq) onChange(rows);
+                    } catch (e) {
+                        console.error(`Firebase decrypt ${label} error:`, e);
+                        if (onError) onError(e);
+                    }
+                }, (e) => {
+                    console.error(`Firebase onSnapshot ${label} error:`, e);
+                    if (onError) onError(e);
+                });
+            } catch (e) {
+                console.error(`Firebase listen ${label} error:`, e);
+                if (onError) onError(e);
+                return () => {};
+            }
+        };
+
+        /* ── TRANSPORTE Firebase ── */
+        window._fbGetTransporte = rowsGet('transporte', 'transporte');
+        window._fbSetTransporte = rowsSet('transporte', 'transporte');
 
         /* ── Merge de 3 vías para evitar que dos instancias (p.ej. local y NAS)
            se pisen los cambios al guardar el array completo del panel de transporte.
@@ -196,12 +397,13 @@
         window._fbMergeTransporte = async (localRows, baseRows) => {
             try {
                 let mergedResult = null;
+                const aad = 'transporte/entries';
                 await runTransaction(db, async (tx) => {
                     const ref = doc(db, 'transporte', 'entries');
                     const snap = await tx.get(ref);
-                    const theirsRows = snap.exists() ? (snap.data().rows || []) : [];
+                    const theirsRows = snap.exists() ? (((await decodeDoc(snap.data(), aad)) || {}).rows || []) : [];
                     const merged = mergeTransportArrays(baseRows, localRows, theirsRows);
-                    tx.set(ref, { rows: merged });
+                    tx.set(ref, await encodeDoc({ rows: merged }, aad));
                     mergedResult = merged;
                 });
                 return mergedResult;
@@ -214,120 +416,34 @@
         /* Escucha en tiempo real los cambios del panel de transporte: cualquier
            usuario (o el propio borrado automático al pasar un RMA a Pretest) se
            refleja al instante en todos los paneles abiertos, sin recargar. */
-        window._fbListenTransporte = (onChange, onError) => {
-            try {
-                return onSnapshot(doc(db, 'transporte', 'entries'), (snap) => {
-                    onChange(snap.exists() ? (snap.data().rows || []) : []);
-                }, (e) => {
-                    console.error('Firebase onSnapshot transporte error:', e);
-                    if (onError) onError(e);
-                });
-            } catch (e) {
-                console.error('Firebase listen transporte error:', e);
-                if (onError) onError(e);
-                return () => {};
-            }
-        };
+        window._fbListenTransporte = rowsListen('transporte', 'transporte');
 
         /* ── INCIDENCIAS Firebase ── */
-        window._fbGetIncidencias = async () => {
-            try {
-                const snap = await getDoc(doc(db, 'incidencias', 'entries'));
-                return snap.exists() ? (snap.data().rows || []) : [];
-            } catch (e) {
-                console.error('Firebase get incidencias error:', e);
-                return [];
-            }
-        };
-
-        window._fbSetIncidencias = async (rows) => {
-            try {
-                await setDoc(doc(db, 'incidencias', 'entries'), { rows });
-            } catch (e) {
-                console.error('Firebase set incidencias error:', e);
-            }
-        };
+        window._fbGetIncidencias = rowsGet('incidencias', 'incidencias');
+        window._fbSetIncidencias = rowsSet('incidencias', 'incidencias');
 
         /* ── HISTORIAL DE INCIDENCIAS Firebase ── */
-        window._fbGetIncidenciasHistorial = async () => {
-            try {
-                const snap = await getDoc(doc(db, 'incidencias_historial', 'entries'));
-                return snap.exists() ? (snap.data().rows || []) : [];
-            } catch (e) {
-                console.error('Firebase get incidencias_historial error:', e);
-                return [];
-            }
-        };
-
-        window._fbSetIncidenciasHistorial = async (rows) => {
-            try {
-                await setDoc(doc(db, 'incidencias_historial', 'entries'), { rows });
-            } catch (e) {
-                console.error('Firebase set incidencias_historial error:', e);
-            }
-        };
+        window._fbGetIncidenciasHistorial = rowsGet('incidencias_historial', 'incidencias_historial');
+        window._fbSetIncidenciasHistorial = rowsSet('incidencias_historial', 'incidencias_historial');
 
         /* ── SEGUIMIENTO RMA Firebase ── */
-        window._fbGetRmaTracking = async () => {
-            try {
-                const snap = await getDoc(doc(db, 'rma_tracking', 'entries'));
-                return snap.exists() ? (snap.data().rows || []) : [];
-            } catch (e) {
-                console.error('Firebase get rma_tracking error:', e);
-                return [];
-            }
-        };
-
-        window._fbSetRmaTracking = async (rows) => {
-            try {
-                await setDoc(doc(db, 'rma_tracking', 'entries'), { rows });
-            } catch (e) {
-                console.error('Firebase set rma_tracking error:', e);
-            }
-        };
+        window._fbGetRmaTracking = rowsGet('rma_tracking', 'rma_tracking');
+        window._fbSetRmaTracking = rowsSet('rma_tracking', 'rma_tracking');
 
         /* Escucha en tiempo real los cambios de fase del Seguimiento RMA: cualquier
            usuario que mueva un RMA de columna lo actualiza al instante para todos
            los que tengan el panel abierto (sin depender de recargas ni intervalos). */
-        window._fbListenRmaTracking = (onChange, onError) => {
-            try {
-                return onSnapshot(doc(db, 'rma_tracking', 'entries'), (snap) => {
-                    onChange(snap.exists() ? (snap.data().rows || []) : []);
-                }, (e) => {
-                    console.error('Firebase onSnapshot rma_tracking error:', e);
-                    if (onError) onError(e);
-                });
-            } catch (e) {
-                console.error('Firebase listen rma_tracking error:', e);
-                if (onError) onError(e);
-                return () => {};
-            }
-        };
+        window._fbListenRmaTracking = rowsListen('rma_tracking', 'rma_tracking');
 
         /* ── HISTORIAL DE FASES RMA Firebase ── */
-        window._fbGetRmaHistorial = async () => {
-            try {
-                const snap = await getDoc(doc(db, 'rma_historial', 'entries'));
-                return snap.exists() ? (snap.data().rows || []) : [];
-            } catch (e) {
-                console.error('Firebase get rma_historial error:', e);
-                return [];
-            }
-        };
-
-        window._fbSetRmaHistorial = async (rows) => {
-            try {
-                await setDoc(doc(db, 'rma_historial', 'entries'), { rows });
-            } catch (e) {
-                console.error('Firebase set rma_historial error:', e);
-            }
-        };
+        window._fbGetRmaHistorial = rowsGet('rma_historial', 'rma_historial');
+        window._fbSetRmaHistorial = rowsSet('rma_historial', 'rma_historial');
 
         /* ── CONTABILIDAD RMA Firebase (precios de reparación) ── */
         window._fbGetRmaContabilidad = async () => {
             try {
                 const snap = await getDoc(doc(db, 'rma_contabilidad', 'entries'));
-                return snap.exists() ? snap.data() : null;
+                return snap.exists() ? await decodeDoc(snap.data(), 'rma_contabilidad/entries') : null;
             } catch (e) {
                 console.error('Firebase get rma_contabilidad error:', e);
                 return null;
@@ -336,30 +452,15 @@
 
         window._fbSetRmaContabilidad = async (precios) => {
             try {
-                await setDoc(doc(db, 'rma_contabilidad', 'entries'), precios);
+                await setDoc(doc(db, 'rma_contabilidad', 'entries'), await encodeDoc(precios, 'rma_contabilidad/entries'));
             } catch (e) {
                 console.error('Firebase set rma_contabilidad error:', e);
             }
         };
 
         /* ── ROLES DE USUARIO Firebase ── */
-        window._fbGetUserRoles = async () => {
-            try {
-                const snap = await getDoc(doc(db, 'user_roles', 'entries'));
-                return snap.exists() ? (snap.data().rows || []) : [];
-            } catch (e) {
-                console.error('Firebase get user_roles error:', e);
-                return [];
-            }
-        };
-
-        window._fbSetUserRoles = async (rows) => {
-            try {
-                await setDoc(doc(db, 'user_roles', 'entries'), { rows });
-            } catch (e) {
-                console.error('Firebase set user_roles error:', e);
-            }
-        };
+        window._fbGetUserRoles = rowsGet('user_roles', 'user_roles');
+        window._fbSetUserRoles = rowsSet('user_roles', 'user_roles');
 
         window._firebaseReady = true;
         document.dispatchEvent(new Event('firebaseReady'));
@@ -1005,6 +1106,18 @@
         .login-btn-secondary:hover { background: #565e64; }
         .login-hint { font-size: 0.75rem; color: var(--secondary-color); margin: 12px 0 0; }
 
+        /* Pantalla de clave de cifrado (reutiliza el aspecto del login) */
+        #crypto-screen {
+            position: fixed; inset: 0; background: var(--background-color);
+            display: none; align-items: center; justify-content: center;
+            z-index: 3100; padding: 20px; box-sizing: border-box;
+        }
+        .crypto-remember {
+            display: flex; align-items: center; justify-content: flex-start; font-size: 0.82rem;
+            color: var(--secondary-color); margin: 0 0 10px; cursor: pointer; text-align: left;
+        }
+        .login-box .crypto-remember input { width: auto; margin: 0 8px 0 0; }
+
         .user-bar {
             display: none; align-items: center; justify-content: flex-end; gap: 12px;
             max-width: 90%; width: 100%; margin: 0 auto; padding: 8px 20px 0; box-sizing: border-box;
@@ -1287,6 +1400,21 @@
     </style>
 </head>
 <body>
+
+<!-- ── PANTALLA DE CLAVE DE CIFRADO ── -->
+<div id="crypto-screen">
+    <div class="login-box">
+        <h1><i class="fas fa-key"></i> <span id="crypto-title">Clave de cifrado</span></h1>
+        <p class="login-subtitle" id="crypto-subtitle"></p>
+        <input type="password" id="crypto-pass" placeholder="Clave de cifrado" autocomplete="off">
+        <input type="password" id="crypto-pass2" placeholder="Repite la clave de cifrado" autocomplete="off" style="display:none;">
+        <label class="crypto-remember" id="crypto-remember-row"><input type="checkbox" id="crypto-remember"> Recordar en este equipo</label>
+        <div id="crypto-error" class="login-error"></div>
+        <button id="crypto-btn" class="login-btn"><i class="fas fa-unlock"></i> Desbloquear</button>
+        <button id="crypto-logout-btn" class="login-btn login-btn-secondary"><i class="fas fa-sign-out-alt"></i> Cerrar sesión</button>
+        <p class="login-hint" id="crypto-hint"></p>
+    </div>
+</div>
 
 <!-- ── LOGIN SCREEN ── -->
 <div id="login-screen">
@@ -1754,8 +1882,17 @@
                 </div>
 
                 <div class="settings-backup-section">
+                    <h3 class="settings-backup-title"><i class="fas fa-shield-alt"></i> Cifrado de datos</h3>
+                    <p class="settings-backup-desc">Todos los datos se guardan cifrados en Firebase (AES-256-GCM) con la clave de cifrado; solo quien la conoce puede leerlos. Si se pierde la clave, los datos no se pueden recuperar.</p>
+                    <div class="settings-backup-actions">
+                        <button id="settings-forget-key-btn" class="rma-add-btn" style="background:var(--secondary-color);"><i class="fas fa-eraser"></i> Olvidar la clave en este equipo</button>
+                    </div>
+                    <div id="settings-crypto-status" class="settings-backup-status"></div>
+                </div>
+
+                <div class="settings-backup-section">
                     <h3 class="settings-backup-title"><i class="fas fa-database"></i> Copia de seguridad de todos los datos</h3>
-                    <p class="settings-backup-desc">Exporta todos los datos de la aplicación (recogidas, transporte, incidencias, seguimiento y contabilidad RMA, usuarios y delegaciones) a un archivo Excel, o restáuralos a partir de un archivo exportado anteriormente.</p>
+                    <p class="settings-backup-desc">Exporta todos los datos de la aplicación (recogidas, transporte, incidencias, seguimiento y contabilidad RMA, usuarios y delegaciones) a un archivo Excel, o restáuralos a partir de un archivo exportado anteriormente. Ojo: el archivo Excel exportado NO está cifrado, guárdalo en un lugar seguro.</p>
                     <div class="settings-backup-actions">
                         <button id="settings-export-btn" class="rma-add-btn"><i class="fas fa-file-export"></i> Exportar datos (Excel)</button>
                         <button id="settings-import-btn" class="rma-add-btn" style="background:var(--secondary-color);"><i class="fas fa-file-import"></i> Importar datos (Excel)</button>
@@ -2163,6 +2300,8 @@ document.addEventListener('DOMContentLoaded', () => {
     const settingsImportBtn      = document.getElementById('settings-import-btn');
     const settingsImportFile     = document.getElementById('settings-import-file');
     const settingsBackupStatus   = document.getElementById('settings-backup-status');
+    const forgetKeyBtn           = document.getElementById('settings-forget-key-btn');
+    const cryptoStatusEl         = document.getElementById('settings-crypto-status');
     const delegOpenBtn           = document.getElementById('settings-deleg-open-btn');
     const delegOverlay           = document.getElementById('deleg-modal-overlay');
     const delegCloseBtn          = document.getElementById('deleg-close-btn');
@@ -3433,7 +3572,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     /* Refresco periódico de seguridad cada 5 minutos, por si el listener en
        tiempo real se hubiera desconectado silenciosamente */
-    setInterval(() => { if (!rmaRealtimeUnsub) loadRmaTracking(); }, 5 * 60 * 1000);
+    setInterval(() => { if (!rmaRealtimeUnsub && window._fbCryptoReady && window._fbCryptoReady()) loadRmaTracking(); }, 5 * 60 * 1000);
 
     /* ── Filtro de fases visibles en el tablero (checkboxes) ── */
     const RMA_PHASE_FILTER_KEY = 'rmaVisiblePhases';
@@ -5375,9 +5514,142 @@ document.addEventListener('DOMContentLoaded', () => {
        AUTENTICACIÓN
     ════════════════════════════════════════ */
 
+    /* ── Clave de cifrado: pantalla de desbloqueo / primera configuración ── */
+    const cryptoScreen    = document.getElementById('crypto-screen');
+    const cryptoTitle     = document.getElementById('crypto-title');
+    const cryptoSubtitle  = document.getElementById('crypto-subtitle');
+    const cryptoPass      = document.getElementById('crypto-pass');
+    const cryptoPass2     = document.getElementById('crypto-pass2');
+    const cryptoRememberRow = document.getElementById('crypto-remember-row');
+    const cryptoRemember  = document.getElementById('crypto-remember');
+    const cryptoError     = document.getElementById('crypto-error');
+    const cryptoBtn       = document.getElementById('crypto-btn');
+    const cryptoLogoutBtn = document.getElementById('crypto-logout-btn');
+    const cryptoHint      = document.getElementById('crypto-hint');
+    let cryptoResolve = null;
+    let cryptoMode = 'unlock';   // 'unlock' | 'setup' | 'wait' | 'error' | 'unsupported'
+
+    function showCryptoScreen(mode) {
+        cryptoMode = mode;
+        cryptoError.textContent = '';
+        cryptoPass.value = ''; cryptoPass2.value = '';
+        const inputs = (mode === 'unlock' || mode === 'setup');
+        cryptoPass.style.display  = inputs ? '' : 'none';
+        cryptoPass2.style.display = (mode === 'setup') ? '' : 'none';
+        cryptoRememberRow.style.display = inputs ? 'flex' : 'none';
+        cryptoBtn.style.display = (mode === 'unsupported') ? 'none' : '';
+        const cfg = {
+            unlock: ['Clave de cifrado', 'Introduce la clave de cifrado para descifrar los datos.', '<i class="fas fa-unlock"></i> Desbloquear', 'Si no la conoces, pídesela al administrador.'],
+            setup:  ['Crear clave de cifrado', 'Primera puesta en marcha: elige la clave con la que se cifrarán todos los datos.', '<i class="fas fa-key"></i> Crear clave', 'Mínimo 10 caracteres; mejor una frase. Guárdala bien: si se pierde, los datos NO se pueden recuperar.'],
+            wait:   ['Cifrado sin configurar', 'El administrador todavía no ha creado la clave de cifrado. Vuelve a intentarlo cuando lo haya hecho.', '<i class="fas fa-redo"></i> Reintentar', ''],
+            error:  ['No se pudo comprobar el cifrado', 'No se pudo leer la configuración de cifrado. Revisa la conexión y las reglas de Firestore.', '<i class="fas fa-redo"></i> Reintentar', ''],
+            unsupported: ['Cifrado no disponible', 'Este navegador o esta dirección no permite el cifrado (hace falta abrir la web por HTTPS o desde localhost). Por seguridad no se cargan ni se guardan datos sin cifrar.', '', '']
+        }[mode];
+        cryptoTitle.textContent = cfg[0];
+        cryptoSubtitle.textContent = cfg[1];
+        cryptoBtn.innerHTML = cfg[2];
+        cryptoHint.textContent = cfg[3];
+        cryptoScreen.style.display = 'flex';
+        if (inputs) cryptoPass.focus();
+    }
+
+    function finishCrypto(ok) {
+        cryptoScreen.style.display = 'none';
+        const r = cryptoResolve;
+        cryptoResolve = null;
+        if (r) r(ok);
+    }
+
+    async function refreshCryptoMode() {
+        if (!window._fbCryptoSupported || !window._fbCryptoSupported()) { showCryptoScreen('unsupported'); return; }
+        let status;
+        try { status = await window._fbCryptoStatus(); }
+        catch (e) { console.error(e); showCryptoScreen('error'); return; }
+        if (status.exists) {
+            if (await window._fbCryptoTryRemembered()) { finishCrypto(true); return; }
+            showCryptoScreen('unlock');
+        } else {
+            showCryptoScreen(currentUserEmail.toLowerCase() === ADMIN_EMAIL ? 'setup' : 'wait');
+        }
+    }
+
+    /* Devuelve true cuando la clave de cifrado está lista; false si el usuario cierra sesión */
+    function ensureDataKey() {
+        if (window._fbCryptoReady && window._fbCryptoReady()) return Promise.resolve(true);
+        loginScreen.style.display = 'none';
+        return new Promise((resolve) => {
+            cryptoResolve = resolve;
+            refreshCryptoMode();
+        });
+    }
+
+    async function submitCrypto() {
+        if (cryptoMode === 'wait' || cryptoMode === 'error') { await refreshCryptoMode(); return; }
+        if (cryptoMode !== 'unlock' && cryptoMode !== 'setup') return;
+        const pass = cryptoPass.value;
+        cryptoError.textContent = '';
+        if (!pass) { cryptoError.textContent = 'Introduce la clave de cifrado'; return; }
+        if (cryptoMode === 'setup') {
+            if (pass.length < 10) { cryptoError.textContent = 'La clave debe tener al menos 10 caracteres'; return; }
+            if (pass !== cryptoPass2.value) { cryptoError.textContent = 'Las dos claves no coinciden'; return; }
+        }
+        const prevLabel = cryptoBtn.innerHTML;
+        cryptoBtn.disabled = true;
+        cryptoBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Comprobando...';
+        try {
+            if (cryptoMode === 'setup') await window._fbCryptoSetup(pass, cryptoRemember.checked);
+            else await window._fbCryptoUnlock(pass, cryptoRemember.checked);
+            cryptoPass.value = ''; cryptoPass2.value = '';
+            finishCrypto(true);
+        } catch (e) {
+            if (e && e.message === 'wrong') cryptoError.textContent = 'Clave de cifrado incorrecta';
+            else if (e && e.message === 'exists') { await refreshCryptoMode(); cryptoError.textContent = 'La clave ya había sido creada: introdúcela para continuar'; }
+            else if (e && e.message === 'nosetup') { await refreshCryptoMode(); }
+            else { console.error(e); cryptoError.textContent = 'No se pudo completar la operación'; }
+        }
+        cryptoBtn.disabled = false;
+        if (cryptoScreen.style.display !== 'none' && (cryptoMode === 'unlock' || cryptoMode === 'setup')) cryptoBtn.innerHTML = prevLabel;
+    }
+
+    cryptoBtn.addEventListener('click', submitCrypto);
+    cryptoPass.addEventListener('keydown',  (e) => { if (e.key === 'Enter') { if (cryptoMode === 'setup') cryptoPass2.focus(); else submitCrypto(); } });
+    cryptoPass2.addEventListener('keydown', (e) => { if (e.key === 'Enter') submitCrypto(); });
+    cryptoLogoutBtn.addEventListener('click', () => {
+        finishCrypto(false);
+        if (window._fbSignOut) window._fbSignOut();
+    });
+
+    /* ── Carga / descarga de datos: solo con sesión iniciada y clave disponible ── */
+    function startDataSync() {
+        startTransporteRealtimeSync();
+        loadIncidencias();
+        startRmaRealtimeSync();
+        loadRmaHistorial();
+        loadRmaContabilidad();
+    }
+
+    function stopDataSync() {
+        if (transporteRealtimeUnsub) { try { transporteRealtimeUnsub(); } catch (e) {} transporteRealtimeUnsub = null; }
+        if (rmaRealtimeUnsub)        { try { rmaRealtimeUnsub(); }        catch (e) {} rmaRealtimeUnsub = null; }
+        transportEntries = []; lastSyncedTransportRows = []; incidencias = [];
+        rmaTracking = []; rmaHistorial = []; userRoles = [];
+        rmaContabilidad = { precioGarantia: null, precioFueraGarantia: null, historico: [], beneficioClearedAt: null };
+        if (window._fbCryptoLock) window._fbCryptoLock();
+        try { renderTransport(); renderIncidencias(); renderRmaTracking(); renderDashboard(); renderDashBeneficioChart(); } catch (e) {}
+    }
+
+    forgetKeyBtn.addEventListener('click', () => {
+        if (window._fbCryptoForget) window._fbCryptoForget();
+        cryptoStatusEl.className = 'settings-backup-status success';
+        cryptoStatusEl.textContent = 'Este equipo ya no recuerda la clave: se pedirá la próxima vez que inicies sesión.';
+    });
+
     async function handleAuthChange(user) {
         if (user) {
             currentUserEmail = user.email || '';
+            const unlocked = await ensureDataKey();
+            if (!unlocked) return;
+            startDataSync();
             await loadUserRoles();
             isAdmin = getRoleForEmail(currentUserEmail) === 'admin';
 
@@ -5398,6 +5670,9 @@ document.addEventListener('DOMContentLoaded', () => {
         } else {
             currentUserEmail = '';
             isAdmin = false;
+            if (cryptoResolve) finishCrypto(false);
+            cryptoScreen.style.display = 'none';
+            stopDataSync();
             document.body.classList.remove('restricted-mode');
             loginScreen.style.display = 'flex';
             mainContainerEl.style.display = 'none';
@@ -5443,22 +5718,14 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     /* ════════════════════════════════════════
-       INIT – load transport from Firebase
+       INIT – autenticación (los datos se cargan después del login)
     ════════════════════════════════════════ */
+    /* Los datos ya NO se cargan al abrir la página: se cargan tras iniciar sesión y
+       desbloquear la clave de cifrado (ver handleAuthChange → startDataSync). */
     if (window._firebaseReady) {
-        startTransporteRealtimeSync();
-        loadIncidencias();
-        startRmaRealtimeSync();
-        loadRmaHistorial();
-        loadRmaContabilidad();
         initAuthListener();
     } else {
         document.addEventListener('firebaseReady', () => {
-            startTransporteRealtimeSync();
-            loadIncidencias();
-            startRmaRealtimeSync();
-            loadRmaHistorial();
-            loadRmaContabilidad();
             initAuthListener();
         });
     }
