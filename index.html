@@ -141,6 +141,7 @@
 
         const CRYPTO_CHECK_AAD = 'config/crypto';
         const REMEMBER_KEY = 'enc_key_v1';
+        let currentSalt = null;   // sal (base64) de la clave con la que esta sesión desbloqueó los datos
         const cryptoRef = () => doc(db, 'config', 'crypto');
 
         function rememberMaster(saltB64, master) {
@@ -149,7 +150,7 @@
 
         window._fbCryptoSupported = cryptoSupported;
         window._fbCryptoReady = () => !!cryptoKeys;
-        window._fbCryptoLock = () => { cryptoKeys = null; };
+        window._fbCryptoLock = () => { cryptoKeys = null; currentSalt = null; };
         window._fbCryptoRemembered = () => { try { return !!localStorage.getItem(REMEMBER_KEY); } catch (e) { return false; } };
         window._fbCryptoForget = () => { try { localStorage.removeItem(REMEMBER_KEY); } catch (e) {} };
 
@@ -173,6 +174,7 @@
                 tx.set(cryptoRef(), { salt: saltB64, check });
             });
             cryptoKeys = keys;
+            currentSalt = saltB64;
             if (remember) rememberMaster(saltB64, master);
         };
 
@@ -188,6 +190,7 @@
                 if (!r || r.ok !== true) throw new Error('bad');
             } catch (e) { throw new Error('wrong'); }
             cryptoKeys = keys;
+            currentSalt = salt;
             if (remember) rememberMaster(salt, master);
         };
 
@@ -204,8 +207,154 @@
                 const r = await decryptWith(keys, snap.data().check, CRYPTO_CHECK_AAD);
                 if (!r || r.ok !== true) throw new Error('bad');
                 cryptoKeys = keys;
+                currentSalt = saved.salt;
                 return true;
             } catch (e) { window._fbCryptoForget(); return false; }
+        };
+
+
+        /* ══════════════════════════════════════════════════════════════
+           CAMBIO DE LA CLAVE DE CIFRADO
+           Al cambiar la clave hay que volver a cifrar TODOS los datos con la nueva:
+           - Los documentos <colección>/entries y config/crypto se reescriben en UNA
+             transacción (o se guardan todos, o no cambia nada).
+           - Las delegaciones usan un ID derivado de la clave (HMAC), así que cambian de
+             ID: primero se escriben las nuevas (sin tocar las antiguas), después se
+             confirma la transacción y por último se borran las antiguas.
+           Las demás sesiones abiertas se bloquean solas (ver _fbWatchCryptoChange).
+        ══════════════════════════════════════════════════════════════ */
+        async function blindIdWith(keys, text) {
+            const sig = await crypto.subtle.sign('HMAC', keys.hmac, _te.encode(text));
+            return Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, '0')).join('');
+        }
+        async function commitInChunks(ops, size = 400) {
+            for (let i = 0; i < ops.length; i += size) {
+                const batch = writeBatch(db);
+                ops.slice(i, i + size).forEach(op => op(batch));
+                await batch.commit();
+            }
+        }
+        const ENCRYPTED_SINGLE_DOCS = ['transporte', 'incidencias', 'incidencias_historial', 'rma_tracking', 'rma_historial', 'rma_contabilidad', 'user_roles'];
+
+        window._fbCryptoChange = async (currentPass, newPass, remember, onProgress) => {
+            if (!cryptoSupported()) throw new Error('nocrypto');
+            if (!cryptoKeys) throw new Error('locked');
+            const progress = (m) => { try { if (onProgress) onProgress(m); } catch (e) {} };
+
+            /* 1) Comprobar la clave actual */
+            progress('Comprobando la clave actual…');
+            const snap0 = await getDoc(cryptoRef());
+            if (!snap0.exists()) throw new Error('nosetup');
+            const oldSalt = snap0.data().salt;
+            const oldMaster = await deriveMaster(currentPass, b64dec(oldSalt));
+            const oldKeys = await keysFromMaster(oldMaster);
+            try {
+                const r = await decryptWith(oldKeys, snap0.data().check, CRYPTO_CHECK_AAD);
+                if (!r || r.ok !== true) throw new Error('bad');
+            } catch (e) { throw new Error('wrong'); }
+
+            /* 2) Derivar la nueva clave (sal nueva) */
+            progress('Generando la nueva clave…');
+            const newSaltBytes = crypto.getRandomValues(new Uint8Array(16));
+            const newSalt = b64enc(newSaltBytes);
+            const newMaster = await deriveMaster(newPass, newSaltBytes);
+            const newKeys = await keysFromMaster(newMaster);
+            const newCheck = await encryptWith(newKeys, { ok: true, t: Date.now() }, CRYPTO_CHECK_AAD);
+
+            /* 3) Delegaciones: descifrar con la clave antigua y preparar las copias nuevas */
+            progress('Recifrando delegaciones…');
+            const delegSnap = await getDocs(collection(db, 'delegaciones'));
+            const newDelegOps = [];      // escrituras de los documentos nuevos
+            const newDelegRefs = [];     // para poder deshacer si algo falla
+            const newDelegIds = new Set();
+            const oldDelegRefs = [];     // los que se borran al final
+            let skipped = 0;
+            for (const d of delegSnap.docs) {
+                try {
+                    const raw = d.data();
+                    const data = isEncrypted(raw) ? await decryptWith(oldKeys, raw, 'delegaciones/' + d.id) : raw;
+                    const key = delegKeyOf(data && data.phone);
+                    if (!key) { skipped++; continue; }
+                    const newId = await blindIdWith(newKeys, 'delegacion:' + key);
+                    const newRef = doc(db, 'delegaciones', newId);
+                    const payload = await encryptWith(newKeys, data, 'delegaciones/' + newId);
+                    newDelegOps.push((b) => b.set(newRef, payload));
+                    newDelegRefs.push(newRef);
+                    newDelegIds.add(newId);
+                    oldDelegRefs.push(d.ref);
+                } catch (e) {
+                    console.error('Delegación no recifrada (se deja como está):', d.id, e);
+                    skipped++;
+                }
+            }
+            const undoNewDelegs = async () => {
+                try { await commitInChunks(newDelegRefs.map(r => (b) => b.delete(r))); } catch (e) {}
+            };
+
+            try {
+                await commitInChunks(newDelegOps);
+            } catch (e) {
+                await undoNewDelegs();
+                throw e;
+            }
+
+            /* 4) Transacción: reescribir todos los documentos de datos y la clave */
+            progress('Recifrando el resto de datos…');
+            const prevKeys = cryptoKeys, prevSalt = currentSalt;
+            const targets = ENCRYPTED_SINGLE_DOCS.map(c => ({ ref: doc(db, c, 'entries'), aad: c + '/entries' }));
+            try {
+                await runTransaction(db, async (tx) => {
+                    const cs = await tx.get(cryptoRef());
+                    if (!cs.exists() || cs.data().salt !== oldSalt) throw new Error('changed');
+                    const snaps = [];
+                    for (const t of targets) snaps.push(await tx.get(t.ref));
+                    const outs = [];
+                    for (let i = 0; i < targets.length; i++) {
+                        if (!snaps[i].exists()) continue;
+                        const raw = snaps[i].data();
+                        const obj = isEncrypted(raw) ? await decryptWith(oldKeys, raw, targets[i].aad) : raw;
+                        outs.push({ ref: targets[i].ref, payload: await encryptWith(newKeys, obj, targets[i].aad) });
+                    }
+                    outs.forEach(o => tx.set(o.ref, o.payload));
+                    tx.set(cryptoRef(), { salt: newSalt, check: newCheck });
+                    /* A partir de aquí esta sesión ya trabaja con la clave nueva (los listeners en
+                       tiempo real recibirán los documentos nuevos y deben poder descifrarlos). */
+                    cryptoKeys = newKeys;
+                    currentSalt = newSalt;
+                });
+            } catch (e) {
+                cryptoKeys = prevKeys;
+                currentSalt = prevSalt;
+                await undoNewDelegs();
+                throw e;
+            }
+
+            /* 5) Borrar las delegaciones antiguas (si falla, quedan huérfanas pero ilegibles e inofensivas) */
+            progress('Limpiando datos antiguos…');
+            let cleanupFailed = false;
+            try {
+                await commitInChunks(oldDelegRefs.filter(r => !newDelegIds.has(r.id)).map(r => (b) => b.delete(r)));
+            } catch (e) {
+                console.error('No se pudieron borrar las delegaciones antiguas:', e);
+                cleanupFailed = true;
+            }
+
+            /* 6) Recordar la clave nueva en este equipo (o dejar de recordar la antigua) */
+            window._fbCryptoForget();
+            if (remember) rememberMaster(newSalt, newMaster);
+
+            return { skipped, cleanupFailed };
+        };
+
+        /* Avisa si OTRO equipo cambia la clave mientras esta sesión está abierta: seguir
+           escribiendo con la clave antigua mezclaría datos ilegibles con los nuevos. */
+        window._fbWatchCryptoChange = (onChanged) => {
+            try {
+                return onSnapshot(cryptoRef(), (snap) => {
+                    if (!cryptoKeys || !currentSalt || !snap.exists()) return;
+                    if (snap.data().salt !== currentSalt) onChanged();
+                }, () => {});
+            } catch (e) { return () => {}; }
         };
 
         /* ── DELEGACIONES: el ID del documento es un HMAC del teléfono (no el teléfono) y
@@ -1190,7 +1339,7 @@
            CONFIGURACIÓN GENERAL
         ══════════════════════════════════════════ */
         .settings-add-form { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; align-items: center; }
-        .settings-add-form input[type="email"], .settings-add-form input[type="text"] {
+        .settings-add-form input[type="email"], .settings-add-form input[type="text"], .settings-add-form input[type="password"] {
             border: 1px solid var(--border-color); border-radius: 5px; padding: 8px 10px;
             font-family: inherit; font-size: 0.88rem; color: var(--text-color); flex: 1; min-width: 180px;
         }
@@ -1211,6 +1360,11 @@
         .settings-backup-status { margin-top: 10px; font-size: 0.85rem; min-height: 1.1em; }
         .settings-backup-status.success { color: #1a7f37; }
         .settings-backup-status.error { color: #c0392b; }
+        .settings-keychange-form { display: none; margin-top: 14px; flex-direction: column; align-items: stretch; }
+        .settings-keychange-form.show { display: flex; }
+        .settings-keychange-form input[type="password"] { flex: none; width: 100%; box-sizing: border-box; }
+        .settings-keychange-form label { font-size: 0.85rem; display: flex; align-items: center; gap: 6px; cursor: pointer; }
+        .settings-keychange-warn { font-size: 0.82rem; color: #8a5a00; background: #fff8e6; border: 1px solid #f3dca0; border-radius: 5px; padding: 8px 10px; }
 
         .settings-users-list { display: flex; flex-direction: column; gap: 8px; }
         .settings-user-row {
@@ -1885,7 +2039,19 @@
                     <h3 class="settings-backup-title"><i class="fas fa-shield-alt"></i> Cifrado de datos</h3>
                     <p class="settings-backup-desc">Todos los datos se guardan cifrados en Firebase (AES-256-GCM) con la clave de cifrado; solo quien la conoce puede leerlos. Si se pierde la clave, los datos no se pueden recuperar.</p>
                     <div class="settings-backup-actions">
+                        <button id="settings-change-key-btn" class="rma-add-btn"><i class="fas fa-key"></i> Cambiar la clave de cifrado</button>
                         <button id="settings-forget-key-btn" class="rma-add-btn" style="background:var(--secondary-color);"><i class="fas fa-eraser"></i> Olvidar la clave en este equipo</button>
+                    </div>
+                    <div id="settings-keychange-form" class="settings-add-form settings-keychange-form">
+                        <div class="settings-keychange-warn"><i class="fas fa-exclamation-triangle"></i> Todos los datos se volverán a cifrar con la clave nueva. Asegúrate de que nadie más esté usando la aplicación: las demás sesiones abiertas se cerrarán y tendrán que iniciar sesión con la clave nueva. Si pierdes la clave nueva, los datos no se podrán recuperar.</div>
+                        <input type="password" id="settings-key-current" placeholder="Clave de cifrado actual" autocomplete="off">
+                        <input type="password" id="settings-key-new" placeholder="Clave nueva (mín. 10 caracteres)" autocomplete="off">
+                        <input type="password" id="settings-key-new2" placeholder="Repite la clave nueva" autocomplete="off">
+                        <label><input type="checkbox" id="settings-key-remember"> Recordar la clave nueva en este equipo</label>
+                        <div class="settings-backup-actions">
+                            <button id="settings-key-confirm-btn" class="rma-add-btn"><i class="fas fa-check"></i> Cambiar clave</button>
+                            <button id="settings-key-cancel-btn" class="rma-add-btn" style="background:var(--secondary-color);"><i class="fas fa-times"></i> Cancelar</button>
+                        </div>
                     </div>
                     <div id="settings-crypto-status" class="settings-backup-status"></div>
                 </div>
@@ -2302,6 +2468,14 @@ document.addEventListener('DOMContentLoaded', () => {
     const settingsBackupStatus   = document.getElementById('settings-backup-status');
     const forgetKeyBtn           = document.getElementById('settings-forget-key-btn');
     const cryptoStatusEl         = document.getElementById('settings-crypto-status');
+    const changeKeyBtn           = document.getElementById('settings-change-key-btn');
+    const keyChangeForm          = document.getElementById('settings-keychange-form');
+    const keyCurrentInput        = document.getElementById('settings-key-current');
+    const keyNewInput            = document.getElementById('settings-key-new');
+    const keyNew2Input           = document.getElementById('settings-key-new2');
+    const keyRememberCheck       = document.getElementById('settings-key-remember');
+    const keyConfirmBtn          = document.getElementById('settings-key-confirm-btn');
+    const keyCancelBtn           = document.getElementById('settings-key-cancel-btn');
     const delegOpenBtn           = document.getElementById('settings-deleg-open-btn');
     const delegOverlay           = document.getElementById('deleg-modal-overlay');
     const delegCloseBtn          = document.getElementById('deleg-close-btn');
@@ -5334,7 +5508,7 @@ document.addEventListener('DOMContentLoaded', () => {
         settingsError.textContent = '';
         renderSettingsUsers();
     });
-    settingsCloseBtn.addEventListener('click', () => settingsModalOverlay.classList.remove('show'));
+    settingsCloseBtn.addEventListener('click', () => { settingsModalOverlay.classList.remove('show'); if (!keyChangeBusy) resetKeyChangeForm(); });
     settingsModalOverlay.addEventListener('click', (e) => { if (e.target === settingsModalOverlay) settingsModalOverlay.classList.remove('show'); });
     document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && settingsModalOverlay.classList.contains('show') && !delegOverlay.classList.contains('show')) settingsModalOverlay.classList.remove('show'); });
 
@@ -5621,6 +5795,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     /* ── Carga / descarga de datos: solo con sesión iniciada y clave disponible ── */
     function startDataSync() {
+        startCryptoWatch();
         startTransporteRealtimeSync();
         loadIncidencias();
         startRmaRealtimeSync();
@@ -5629,6 +5804,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function stopDataSync() {
+        stopCryptoWatch();
         if (transporteRealtimeUnsub) { try { transporteRealtimeUnsub(); } catch (e) {} transporteRealtimeUnsub = null; }
         if (rmaRealtimeUnsub)        { try { rmaRealtimeUnsub(); }        catch (e) {} rmaRealtimeUnsub = null; }
         transportEntries = []; lastSyncedTransportRows = []; incidencias = [];
@@ -5636,6 +5812,80 @@ document.addEventListener('DOMContentLoaded', () => {
         rmaContabilidad = { precioGarantia: null, precioFueraGarantia: null, historico: [], beneficioClearedAt: null };
         if (window._fbCryptoLock) window._fbCryptoLock();
         try { renderTransport(); renderIncidencias(); renderRmaTracking(); renderDashboard(); renderDashBeneficioChart(); } catch (e) {}
+    }
+
+
+    /* ── Cambio de la clave de cifrado (solo admin, desde Configuración) ── */
+    let keyChangeBusy = false;
+    window.addEventListener('beforeunload', (e) => { if (keyChangeBusy) { e.preventDefault(); e.returnValue = ''; } });
+
+    function setCryptoStatus(message, type) {
+        cryptoStatusEl.className = 'settings-backup-status' + (type ? ' ' + type : '');
+        cryptoStatusEl.textContent = message || '';
+    }
+    function resetKeyChangeForm() {
+        keyCurrentInput.value = ''; keyNewInput.value = ''; keyNew2Input.value = '';
+        keyChangeForm.classList.remove('show');
+    }
+
+    changeKeyBtn.addEventListener('click', () => {
+        if (!isAdmin) return;
+        setCryptoStatus('');
+        keyRememberCheck.checked = !!(window._fbCryptoRemembered && window._fbCryptoRemembered());
+        keyChangeForm.classList.toggle('show');
+        if (keyChangeForm.classList.contains('show')) keyCurrentInput.focus();
+    });
+    keyCancelBtn.addEventListener('click', () => { if (!keyChangeBusy) { resetKeyChangeForm(); setCryptoStatus(''); } });
+
+    keyConfirmBtn.addEventListener('click', async () => {
+        if (keyChangeBusy || !isAdmin) return;
+        const cur = keyCurrentInput.value, nw = keyNewInput.value, nw2 = keyNew2Input.value;
+        if (!cur || !nw || !nw2) { setCryptoStatus('Rellena los tres campos', 'error'); return; }
+        if (nw.length < 10) { setCryptoStatus('La clave nueva debe tener al menos 10 caracteres', 'error'); return; }
+        if (nw !== nw2) { setCryptoStatus('Las dos claves nuevas no coinciden', 'error'); return; }
+        if (nw === cur) { setCryptoStatus('La clave nueva debe ser distinta de la actual', 'error'); return; }
+        if (!window._fbCryptoChange) { setCryptoStatus('Conectando con el servidor, inténtalo de nuevo en unos segundos', 'error'); return; }
+        if (!confirm('Se volverán a cifrar todos los datos con la clave nueva y se cerrará la sesión de los demás usuarios conectados.\n\nSi pierdes la clave nueva NO se podrán recuperar los datos.\n\n¿Continuar?')) return;
+
+        keyChangeBusy = true;
+        keyConfirmBtn.disabled = true; keyCancelBtn.disabled = true; changeKeyBtn.disabled = true;
+        const prevLabel = keyConfirmBtn.innerHTML;
+        keyConfirmBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Cambiando…';
+        setCryptoStatus('Iniciando el cambio de clave…');
+        try {
+            const res = await window._fbCryptoChange(cur, nw, keyRememberCheck.checked, (m) => setCryptoStatus(m));
+            resetKeyChangeForm();
+            let msg = 'Clave de cifrado cambiada correctamente. Todos los datos están cifrados con la clave nueva.';
+            if (res && res.skipped) msg += ` (${res.skipped} delegación(es) no se pudieron leer con la clave anterior y se han dejado sin tocar.)`;
+            if (res && res.cleanupFailed) msg += ' No se pudieron borrar algunos datos antiguos; no afecta al funcionamiento.';
+            setCryptoStatus(msg, 'success');
+        } catch (e) {
+            const m = e && e.message;
+            if (m === 'wrong')          setCryptoStatus('La clave actual no es correcta', 'error');
+            else if (m === 'changed')   setCryptoStatus('La clave ha sido cambiada desde otro equipo mientras tanto. Vuelve a iniciar sesión.', 'error');
+            else if (m === 'nocrypto')  setCryptoStatus('Este navegador no permite el cifrado necesario', 'error');
+            else if (m === 'locked')    setCryptoStatus('La clave de cifrado no está desbloqueada en esta sesión', 'error');
+            else { console.error(e); setCryptoStatus('No se pudo cambiar la clave. Los datos no se han modificado; inténtalo de nuevo.', 'error'); }
+        }
+        keyChangeBusy = false;
+        keyConfirmBtn.disabled = false; keyCancelBtn.disabled = false; changeKeyBtn.disabled = false;
+        keyConfirmBtn.innerHTML = prevLabel;
+    });
+
+    /* Otro equipo ha cambiado la clave: esta sesión ya no puede leer ni escribir datos correctamente */
+    let cryptoWatchUnsub = null;
+    function startCryptoWatch() {
+        if (cryptoWatchUnsub || !window._fbWatchCryptoChange) return;
+        cryptoWatchUnsub = window._fbWatchCryptoChange(() => {
+            if (keyChangeBusy) return;
+            if (cryptoWatchUnsub) { try { cryptoWatchUnsub(); } catch (e) {} cryptoWatchUnsub = null; }
+            if (window._fbCryptoForget) window._fbCryptoForget();
+            alert('La clave de cifrado se ha cambiado desde otro equipo. Se cerrará la sesión: vuelve a iniciar sesión e introduce la clave nueva.');
+            if (window._fbSignOut) window._fbSignOut();
+        });
+    }
+    function stopCryptoWatch() {
+        if (cryptoWatchUnsub) { try { cryptoWatchUnsub(); } catch (e) {} cryptoWatchUnsub = null; }
     }
 
     forgetKeyBtn.addEventListener('click', () => {
