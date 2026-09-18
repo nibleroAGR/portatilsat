@@ -9,7 +9,7 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
-        import { getFirestore, doc, getDoc, setDoc, onSnapshot, runTransaction, collection, getDocs, writeBatch } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+        import { getFirestore, doc, getDoc, setDoc, onSnapshot, runTransaction, collection, getDocs, writeBatch, deleteDoc } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
         import { getAuth, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, updatePassword, signOut, setPersistence, browserLocalPersistence } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
 
         const firebaseConfig = {
@@ -75,6 +75,19 @@
             } catch (e) {
                 console.error('Firebase set error:', e);
             }
+        };
+
+        /* Versiones "estrictas" (lanzan el error) para la ventana de gestión de delegaciones */
+        window._fbSetDelegacionStrict = async (phone, delegacion) => {
+            const key = String(phone || '').replace(/\D/g, '');
+            if (!key) throw new Error('Teléfono no válido');
+            await setDoc(doc(db, 'delegaciones', key), { delegacion, phone });
+        };
+
+        window._fbDeleteDelegacion = async (phone) => {
+            const key = String(phone || '').replace(/\D/g, '');
+            if (!key) return;
+            await deleteDoc(doc(db, 'delegaciones', key));
         };
 
         window._fbGetAllDelegaciones = async () => {
@@ -1061,7 +1074,7 @@
         .rma-update-item li { color: var(--text-color); font-size: 0.9rem; margin-bottom: 2px; }
 
         /* ══════════════════════════════════════════
-           CONFIGURACIÓN DE USUARIOS
+           CONFIGURACIÓN GENERAL
         ══════════════════════════════════════════ */
         .settings-add-form { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; align-items: center; }
         .settings-add-form input[type="email"], .settings-add-form input[type="text"] {
@@ -1113,6 +1126,33 @@
         .settings-user-pass input.pass-edit-input:focus { outline: none; border-color: var(--primary-color); }
         .settings-user-pass .pass-edit-save { color: #1a8a3c; }
         .settings-user-pass .pass-edit-cancel { color: #c0392b; }
+
+        /* Ventana de delegaciones */
+        #deleg-modal-overlay .modal-box { max-width: 820px; }
+        .deleg-toolbar { display: flex; align-items: center; gap: 12px; margin: 4px 0 12px; flex-wrap: wrap; }
+        .deleg-toolbar input {
+            flex: 1; min-width: 200px; border: 1px solid var(--border-color); border-radius: 5px;
+            padding: 8px 10px; font-family: inherit; font-size: 0.88rem; color: var(--text-color);
+        }
+        .deleg-toolbar input:focus { outline: none; border-color: var(--primary-color); }
+        .deleg-count { font-size: 0.82rem; color: var(--secondary-color); white-space: nowrap; }
+        .deleg-row .deleg-phone { min-width: 130px; font-size: 0.88rem; font-weight: 600; font-family: monospace; }
+        .deleg-row .deleg-name { flex: 1; min-width: 160px; font-size: 0.88rem; }
+        .deleg-row input.deleg-edit {
+            border: 1px solid var(--border-color); border-radius: 4px; padding: 6px 8px;
+            font-family: inherit; font-size: 0.88rem; color: var(--text-color); min-width: 0;
+        }
+        .deleg-row input.deleg-edit:focus { outline: none; border-color: var(--primary-color); }
+        .deleg-row input.deleg-edit.deleg-phone { width: 150px; flex: 0 0 auto; }
+        .deleg-row input.deleg-edit.deleg-name { flex: 1; min-width: 160px; }
+        .deleg-actions { display: flex; align-items: center; gap: 4px; }
+        .deleg-actions button {
+            border: none; background: none; cursor: pointer; color: var(--primary-color);
+            font-size: 0.95rem; padding: 6px 8px; border-radius: 4px; line-height: 1;
+        }
+        .deleg-actions button:hover { background: rgba(0,0,0,0.06); }
+        .deleg-actions .deleg-save { color: #1a8a3c; }
+        .deleg-actions .deleg-cancel, .deleg-actions .deleg-del { color: #c0392b; }
 
         /* ══════════════════════════════════════════
            TABLAS CON SCROLL HORIZONTAL EN PANTALLAS PEQUEÑAS
@@ -1238,6 +1278,8 @@
             .rma-historial-user { min-width: 0; width: 100%; }
 
             .settings-user-row { flex-direction: column; align-items: stretch; }
+            .deleg-row input.deleg-edit.deleg-phone { width: 100%; }
+            .deleg-actions { justify-content: flex-end; }
             .settings-user-email { min-width: 0; }
 
             .login-box { padding: 26px 20px; }
@@ -1296,7 +1338,7 @@
             <button id="ucs-button" title="Abrir aplicación UCS">
                 <i class="fas fa-tools"></i> UCS
             </button>
-            <button id="settings-button" title="Configuración de usuarios">
+            <button id="settings-button" title="Configuración general">
                 <i class="fas fa-cog"></i>
             </button>
         </div>
@@ -1679,15 +1721,17 @@
     </div>
 
     <!-- ══════════════════════════════════════════
-         CONFIGURACIÓN DE USUARIOS (solo admin)
+         CONFIGURACIÓN GENERAL (solo admin)
     ══════════════════════════════════════════ -->
     <div id="settings-modal-overlay" class="modal-overlay">
         <div class="modal-box">
             <div class="modal-header">
-                <h2><i class="fas fa-cog"></i> Configuración de Usuarios</h2>
+                <h2><i class="fas fa-cog"></i> Configuración General</h2>
                 <button id="settings-close-btn" class="modal-close-btn" title="Cerrar"><i class="fas fa-times"></i></button>
             </div>
             <div class="modal-body">
+                <h3 class="settings-backup-title"><i class="fas fa-users"></i> Configuración de Usuarios</h3>
+                <p class="settings-backup-desc">Crea usuarios nuevos y modifica su rol o su contraseña.</p>
                 <div class="settings-add-form">
                     <input type="email" id="settings-new-email" placeholder="Correo del nuevo usuario" autocomplete="off">
                     <input type="text" id="settings-new-password" placeholder="Contraseña temporal (mín. 6 caracteres)" autocomplete="off">
@@ -1702,6 +1746,14 @@
                 <div id="settings-users-list" class="settings-users-list"></div>
 
                 <div class="settings-backup-section">
+                    <h3 class="settings-backup-title"><i class="fas fa-phone-alt"></i> Delegaciones</h3>
+                    <p class="settings-backup-desc">Consulta, modifica o elimina los teléfonos y las delegaciones asociadas a cada uno.</p>
+                    <div class="settings-backup-actions">
+                        <button id="settings-deleg-open-btn" class="rma-add-btn"><i class="fas fa-list"></i> Gestionar delegaciones</button>
+                    </div>
+                </div>
+
+                <div class="settings-backup-section">
                     <h3 class="settings-backup-title"><i class="fas fa-database"></i> Copia de seguridad de todos los datos</h3>
                     <p class="settings-backup-desc">Exporta todos los datos de la aplicación (recogidas, transporte, incidencias, seguimiento y contabilidad RMA, usuarios y delegaciones) a un archivo Excel, o restáuralos a partir de un archivo exportado anteriormente.</p>
                     <div class="settings-backup-actions">
@@ -1711,6 +1763,32 @@
                     </div>
                     <div id="settings-backup-status" class="settings-backup-status"></div>
                 </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ══════════════════════════════════════════
+         DELEGACIONES: teléfonos y delegaciones asociadas (solo admin)
+    ══════════════════════════════════════════ -->
+    <div id="deleg-modal-overlay" class="modal-overlay">
+        <div class="modal-box">
+            <div class="modal-header">
+                <h2><i class="fas fa-phone-alt"></i> Delegaciones</h2>
+                <button id="deleg-close-btn" class="modal-close-btn" title="Cerrar"><i class="fas fa-times"></i></button>
+            </div>
+            <div class="modal-body">
+                <div class="settings-add-form">
+                    <input type="text" id="deleg-new-phone" placeholder="Teléfono" autocomplete="off">
+                    <input type="text" id="deleg-new-name" placeholder="Delegación" autocomplete="off">
+                    <button id="deleg-add-btn" class="rma-add-btn"><i class="fas fa-plus"></i> Añadir</button>
+                </div>
+                <div id="deleg-error" class="login-error" style="text-align:left;"></div>
+                <div class="deleg-toolbar">
+                    <input type="text" id="deleg-search" placeholder="Buscar por teléfono o delegación..." autocomplete="off">
+                    <span id="deleg-count" class="deleg-count"></span>
+                </div>
+                <div id="deleg-empty" class="inc-empty" style="display:none;">No hay delegaciones que mostrar.</div>
+                <div id="deleg-list" class="settings-users-list"></div>
             </div>
         </div>
     </div>
@@ -2085,6 +2163,17 @@ document.addEventListener('DOMContentLoaded', () => {
     const settingsImportBtn      = document.getElementById('settings-import-btn');
     const settingsImportFile     = document.getElementById('settings-import-file');
     const settingsBackupStatus   = document.getElementById('settings-backup-status');
+    const delegOpenBtn           = document.getElementById('settings-deleg-open-btn');
+    const delegOverlay           = document.getElementById('deleg-modal-overlay');
+    const delegCloseBtn          = document.getElementById('deleg-close-btn');
+    const delegNewPhone          = document.getElementById('deleg-new-phone');
+    const delegNewName           = document.getElementById('deleg-new-name');
+    const delegAddBtn            = document.getElementById('deleg-add-btn');
+    const delegError             = document.getElementById('deleg-error');
+    const delegSearch            = document.getElementById('deleg-search');
+    const delegCount             = document.getElementById('deleg-count');
+    const delegEmpty             = document.getElementById('deleg-empty');
+    const delegList              = document.getElementById('deleg-list');
 
     let currentData = [];
     let currentIndex = 0;
@@ -4918,6 +5007,174 @@ document.addEventListener('DOMContentLoaded', () => {
     };
 
     /* ════════════════════════════════════════
+       DELEGACIONES: ver, añadir, modificar y eliminar teléfonos
+    ════════════════════════════════════════ */
+    let delegRows = [];            // [{ phone, delegacion }]
+    let delegEditingKey = null;    // clave (solo dígitos) de la fila en edición
+
+    const delegKey = (phone) => String(phone || '').replace(/\D/g, '');
+
+    async function loadDelegRows() {
+        delegEmpty.style.display = 'none';
+        delegList.innerHTML = '<div class="inc-empty">Cargando...</div>';
+        const rows = window._fbGetAllDelegaciones ? await window._fbGetAllDelegaciones() : [];
+        delegRows = rows
+            .filter(r => delegKey(r.phone))
+            .map(r => ({ phone: String(r.phone), delegacion: r.delegacion || '' }));
+        delegRows.sort((a, b) => a.phone.localeCompare(b.phone, undefined, { numeric: true }));
+        renderDelegRows();
+    }
+
+    function renderDelegRows() {
+        const q = delegSearch.value.trim().toLowerCase();
+        const qDigits = q.replace(/\D/g, '');
+        const visible = delegRows.filter(r => !q
+            || r.phone.toLowerCase().includes(q)
+            || r.delegacion.toLowerCase().includes(q)
+            || (qDigits && delegKey(r.phone).includes(qDigits)));
+
+        delegCount.textContent = q ? `${visible.length} de ${delegRows.length}` : `${delegRows.length} en total`;
+        delegEmpty.style.display = visible.length ? 'none' : 'block';
+        delegEmpty.textContent = delegRows.length ? 'Ninguna delegación coincide con la búsqueda.' : 'Todavía no hay delegaciones guardadas.';
+
+        delegList.innerHTML = visible.map(r => {
+            const key = delegKey(r.phone);
+            if (key === delegEditingKey) {
+                return `
+                <div class="settings-user-row deleg-row">
+                    <input type="text" class="deleg-edit deleg-phone" id="deleg-edit-phone" value="${esc(r.phone)}" placeholder="Teléfono" autocomplete="off">
+                    <input type="text" class="deleg-edit deleg-name" id="deleg-edit-name" value="${esc(r.delegacion)}" placeholder="Delegación" autocomplete="off">
+                    <span class="deleg-actions">
+                        <button type="button" class="deleg-save" title="Guardar" onclick="delegSaveEdit('${key}')"><i class="fas fa-check"></i></button>
+                        <button type="button" class="deleg-cancel" title="Cancelar" onclick="delegCancelEdit()"><i class="fas fa-times"></i></button>
+                    </span>
+                </div>`;
+            }
+            return `
+                <div class="settings-user-row deleg-row">
+                    <span class="deleg-phone">${esc(r.phone)}</span>
+                    <span class="deleg-name">${esc(r.delegacion)}</span>
+                    <span class="deleg-actions">
+                        <button type="button" title="Modificar" onclick="delegStartEdit('${key}')"><i class="fas fa-pen"></i></button>
+                        <button type="button" class="deleg-del" title="Eliminar" onclick="delegRemove('${key}')"><i class="fas fa-trash"></i></button>
+                    </span>
+                </div>`;
+        }).join('');
+
+        if (delegEditingKey !== null) {
+            const nameInput = document.getElementById('deleg-edit-name');
+            if (nameInput) {
+                nameInput.focus();
+                const onKey = (e) => {
+                    if (e.key === 'Enter') delegSaveEdit(delegEditingKey);
+                    if (e.key === 'Escape') { e.stopPropagation(); delegCancelEdit(); }
+                };
+                nameInput.addEventListener('keydown', onKey);
+                document.getElementById('deleg-edit-phone').addEventListener('keydown', onKey);
+            }
+        }
+    }
+
+    window.delegStartEdit = function(key) {
+        delegEditingKey = key;
+        delegError.textContent = '';
+        renderDelegRows();
+    };
+
+    window.delegCancelEdit = function() {
+        delegEditingKey = null;
+        renderDelegRows();
+    };
+
+    window.delegSaveEdit = async function(oldKey) {
+        const phone = document.getElementById('deleg-edit-phone').value.trim();
+        const name  = document.getElementById('deleg-edit-name').value.trim();
+        const newKey = delegKey(phone);
+        delegError.textContent = '';
+
+        if (!newKey) { delegError.textContent = 'Introduce un teléfono válido'; return; }
+        if (!name)   { delegError.textContent = 'Introduce una delegación'; return; }
+        if (newKey !== oldKey && delegRows.some(r => delegKey(r.phone) === newKey)) {
+            delegError.textContent = 'Ya existe una delegación para ese teléfono';
+            return;
+        }
+        try {
+            await window._fbSetDelegacionStrict(phone, name);
+            if (newKey !== oldKey) await window._fbDeleteDelegacion(oldKey);
+            const idx = delegRows.findIndex(r => delegKey(r.phone) === oldKey);
+            if (idx !== -1) delegRows[idx] = { phone, delegacion: name };
+            delegRows.sort((a, b) => a.phone.localeCompare(b.phone, undefined, { numeric: true }));
+            delegEditingKey = null;
+            renderDelegRows();
+            showNotification('Delegación actualizada');
+        } catch (e) {
+            console.error(e);
+            delegError.textContent = 'No se pudo guardar en Firebase';
+        }
+    };
+
+    window.delegRemove = async function(key) {
+        const row = delegRows.find(r => delegKey(r.phone) === key);
+        if (!row) return;
+        if (!confirm(`¿Eliminar el teléfono ${row.phone} (${row.delegacion})?`)) return;
+        delegError.textContent = '';
+        try {
+            await window._fbDeleteDelegacion(key);
+            delegRows = delegRows.filter(r => delegKey(r.phone) !== key);
+            if (delegEditingKey === key) delegEditingKey = null;
+            renderDelegRows();
+            showNotification('Delegación eliminada');
+        } catch (e) {
+            console.error(e);
+            delegError.textContent = 'No se pudo eliminar en Firebase';
+        }
+    };
+
+    async function delegAdd() {
+        const phone = delegNewPhone.value.trim();
+        const name  = delegNewName.value.trim();
+        const key   = delegKey(phone);
+        delegError.textContent = '';
+
+        if (!key)  { delegError.textContent = 'Introduce un teléfono válido'; return; }
+        if (!name) { delegError.textContent = 'Introduce una delegación'; return; }
+        const existing = delegRows.find(r => delegKey(r.phone) === key);
+        if (existing && !confirm(`El teléfono ${existing.phone} ya tiene la delegación "${existing.delegacion}". ¿Sustituirla por "${name}"?`)) return;
+
+        delegAddBtn.disabled = true;
+        try {
+            await window._fbSetDelegacionStrict(phone, name);
+            if (existing) { existing.phone = phone; existing.delegacion = name; }
+            else delegRows.push({ phone, delegacion: name });
+            delegRows.sort((a, b) => a.phone.localeCompare(b.phone, undefined, { numeric: true }));
+            delegNewPhone.value = '';
+            delegNewName.value = '';
+            delegNewPhone.focus();
+            renderDelegRows();
+            showNotification(existing ? 'Delegación actualizada' : 'Delegación añadida');
+        } catch (e) {
+            console.error(e);
+            delegError.textContent = 'No se pudo guardar en Firebase';
+        }
+        delegAddBtn.disabled = false;
+    }
+
+    delegOpenBtn.addEventListener('click', () => {
+        delegOverlay.classList.add('show');
+        delegError.textContent = '';
+        delegSearch.value = '';
+        delegEditingKey = null;
+        loadDelegRows();
+    });
+    delegCloseBtn.addEventListener('click', () => delegOverlay.classList.remove('show'));
+    delegOverlay.addEventListener('click', (e) => { if (e.target === delegOverlay) delegOverlay.classList.remove('show'); });
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && delegOverlay.classList.contains('show')) { e.stopImmediatePropagation(); delegOverlay.classList.remove('show'); } });
+    delegAddBtn.addEventListener('click', delegAdd);
+    delegNewName.addEventListener('keydown', (e) => { if (e.key === 'Enter') delegAdd(); });
+    delegNewPhone.addEventListener('keydown', (e) => { if (e.key === 'Enter') delegNewName.focus(); });
+    delegSearch.addEventListener('input', renderDelegRows);
+
+    /* ════════════════════════════════════════
        VENTANA UCS (app embebida)
     ════════════════════════════════════════ */
     const ucsButton       = document.getElementById('ucs-button');
@@ -4940,7 +5197,7 @@ document.addEventListener('DOMContentLoaded', () => {
     });
     settingsCloseBtn.addEventListener('click', () => settingsModalOverlay.classList.remove('show'));
     settingsModalOverlay.addEventListener('click', (e) => { if (e.target === settingsModalOverlay) settingsModalOverlay.classList.remove('show'); });
-    document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && settingsModalOverlay.classList.contains('show')) settingsModalOverlay.classList.remove('show'); });
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && settingsModalOverlay.classList.contains('show') && !delegOverlay.classList.contains('show')) settingsModalOverlay.classList.remove('show'); });
 
     settingsCreateBtn.addEventListener('click', async () => {
         settingsError.textContent = '';
