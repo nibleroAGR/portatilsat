@@ -1164,6 +1164,11 @@
             margin-bottom: 14px; padding-bottom: 14px; border-bottom: 2px dashed var(--border-color);
         }
         .rma-info-garantia-row > span { font-weight: 700; color: var(--secondary-color); font-size: 0.85rem; }
+        .rma-info-tiempo-input {
+            width: 72px; padding: 6px 8px; border: 2px solid var(--border-color); border-radius: 6px;
+            font-size: 0.9rem; background: transparent; color: inherit;
+        }
+        .rma-info-tiempo-input:focus { outline: none; border-color: var(--primary-color); }
         .rma-garantia-toggle-btn {
             display: inline-flex; align-items: center; gap: 6px;
             padding: 6px 12px; border-radius: 6px; border: 2px solid var(--border-color);
@@ -2000,6 +2005,12 @@
                         <span id="rma-info-espera-label">En espera de…</span>
                     </label>
                 </div>
+                <div id="rma-info-tiempo-row" class="rma-info-garantia-row" style="display:none;">
+                    <span>Añadir tiempo al cronómetro:</span>
+                    <input type="number" id="rma-info-tiempo-h" class="rma-info-tiempo-input" min="0" step="1" placeholder="0" inputmode="numeric" title="Horas"> <span>h</span>
+                    <input type="number" id="rma-info-tiempo-m" class="rma-info-tiempo-input" min="0" step="1" placeholder="0" inputmode="numeric" title="Minutos"> <span>min</span>
+                    <button id="rma-info-tiempo-btn" class="inc-add-update-btn" onclick="rmaInfoAddTiempo()"><i class="fas fa-plus"></i> Añadir tiempo</button>
+                </div>
                 <div id="rma-info-empty" class="inc-no-updates">Todavía no hay información registrada.</div>
                 <div id="rma-info-list" class="inc-updates"></div>
                 <div class="inc-add-update" style="margin-top:12px; border-top:2px dashed var(--border-color); padding-top:14px;">
@@ -2485,6 +2496,9 @@ document.addEventListener('DOMContentLoaded', () => {
     const rmaInfoEsperaRow      = document.getElementById('rma-info-espera-row');
     const rmaInfoEsperaCheck    = document.getElementById('rma-info-espera-check');
     const rmaInfoEsperaLabel    = document.getElementById('rma-info-espera-label');
+    const rmaInfoTiempoRow      = document.getElementById('rma-info-tiempo-row');
+    const rmaInfoTiempoH        = document.getElementById('rma-info-tiempo-h');
+    const rmaInfoTiempoM        = document.getElementById('rma-info-tiempo-m');
     const rmaEsperaModalOverlay = document.getElementById('rma-espera-modal-overlay');
     const rmaEsperaCloseBtn     = document.getElementById('rma-espera-close-btn');
     const rmaEsperaCancelBtn    = document.getElementById('rma-espera-cancel-btn');
@@ -4078,6 +4092,43 @@ document.addEventListener('DOMContentLoaded', () => {
         showNotification('Ya no está en espera: cronómetro reanudado');
     };
 
+    /* Añadir tiempo manualmente al cronómetro (solo en fase Repair, desde Info):
+       suma horas y minutos al tiempo acumulado, con el cronómetro en marcha o pausado, y
+       lo deja registrado en la Info del RMA. */
+    window.rmaInfoAddTiempo = async function() {
+        if (!rmaInfoCurrentId) return;
+        const idx = rmaFindIndex(rmaInfoCurrentId);
+        if (idx === -1) return;
+        const entry = rmaTracking[idx];
+        if (entry.fase !== 'Repair') { renderRmaInfo(); return; }
+
+        const hRaw = rmaInfoTiempoH.value.trim(), mRaw = rmaInfoTiempoM.value.trim();
+        const h = hRaw === '' ? 0 : Number(hRaw);
+        const m = mRaw === '' ? 0 : Number(mRaw);
+        if (!Number.isInteger(h) || !Number.isInteger(m) || h < 0 || m < 0) {
+            showNotification('Indica horas y minutos válidos (números enteros, sin negativos)');
+            return;
+        }
+        const totalMin = h * 60 + m;
+        if (totalMin === 0) { showNotification('Indica las horas y/o minutos que quieres añadir'); return; }
+        if (totalMin > 1000 * 60) { showNotification('Máximo 1000 horas por cada vez que se añade tiempo'); return; }
+
+        if (!entry.cronometro || typeof entry.cronometro !== 'object') entry.cronometro = { running: false, accumulatedMs: 0, startedAt: null };
+        entry.cronometro.accumulatedMs = (entry.cronometro.accumulatedMs || 0) + totalMin * 60000;
+
+        const hh = Math.floor(totalMin / 60), mm = totalMin % 60;
+        const txt = [hh ? `${hh} h` : '', mm ? `${mm} min` : ''].filter(Boolean).join(' ');
+        if (!Array.isArray(entry.info)) entry.info = [];
+        entry.info.push({ id: genId('rmainfo'), fecha: todayISO(), texto: `Añadido al cronómetro: ${txt}.`, usuario: currentUserEmail });
+
+        rmaInfoTiempoH.value = '';
+        rmaInfoTiempoM.value = '';
+        await saveRmaTracking();
+        renderRmaTracking();
+        renderRmaInfo();
+        showNotification(`Añadido al cronómetro: ${txt}`);
+    };
+
     let rmaEsperaPendingId = null;
     function openRmaEsperaModal(id) {
         const entry = rmaTracking.find(e => e.id === id);
@@ -4416,6 +4467,9 @@ document.addEventListener('DOMContentLoaded', () => {
             rmaInfoEsperaCheck.checked = false;
         }
 
+        /* "Añadir tiempo al cronómetro" solo se muestra mientras el RMA está en Repair */
+        rmaInfoTiempoRow.style.display = entry.fase === 'Repair' ? 'flex' : 'none';
+
         const notes = (entry.info || []).slice().sort((a, b) => (a.fecha < b.fecha ? 1 : -1));
         if (notes.length === 0) {
             rmaInfoEmpty.style.display = 'block';
@@ -4461,6 +4515,8 @@ document.addEventListener('DOMContentLoaded', () => {
         rmaInfoEditingId = null;
         rmaInfoAddDate.value = todayISO();
         rmaInfoAddText.value = '';
+        rmaInfoTiempoH.value = '';
+        rmaInfoTiempoM.value = '';
         renderRmaInfo();
         rmaInfoModalOverlay.classList.add('show');
         setTimeout(() => rmaInfoAddText.focus(), 50);
