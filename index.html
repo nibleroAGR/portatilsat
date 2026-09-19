@@ -1989,12 +1989,6 @@
                     <button id="rma-info-garantia-g" class="rma-garantia-toggle-btn" onclick="rmaInfoSetGarantia('G')"><span class="rma-garantia-dot g"></span> En garantía</button>
                     <button id="rma-info-garantia-f" class="rma-garantia-toggle-btn" onclick="rmaInfoSetGarantia('F')"><span class="rma-garantia-dot f"></span> Fuera de garantía</button>
                 </div>
-                <div id="rma-info-extensivo-row" class="rma-info-garantia-row" style="display:none;">
-                    <label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-weight:400;">
-                        <input type="checkbox" id="rma-info-extensivo-check" onchange="rmaInfoToggleTestExtensivo()">
-                        <span>Test Extensivo <span style="font-weight:400; color:var(--secondary-color); font-size:0.8rem;">(pausa el cronómetro mientras esté en Pretest)</span></span>
-                    </label>
-                </div>
                 <div id="rma-info-espera-row" class="rma-info-garantia-row" style="display:none;">
                     <label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-weight:400;">
                         <input type="checkbox" id="rma-info-espera-check" onchange="rmaInfoToggleEspera()">
@@ -2013,7 +2007,7 @@
     </div>
 
     <!-- ══════════════════════════════════════════
-         "EN ESPERA DE…" (Final Test): motivo obligatorio, pausa el cronómetro
+         "EN ESPERA DE…" (Pretest y Final Test): motivo obligatorio, pausa el cronómetro
     ══════════════════════════════════════════ -->
     <div id="rma-espera-modal-overlay" class="modal-overlay">
         <div class="modal-box">
@@ -2025,7 +2019,7 @@
                 <p style="margin:0 0 10px; color: var(--secondary-color); font-size: 0.9rem;">
                     Indica de qué está en espera el RMA <strong id="rma-espera-title"></strong>. Es obligatorio y el cronómetro quedará pausado hasta que desmarques la casilla.
                 </p>
-                <textarea id="rma-espera-text" rows="3" placeholder="Ej.: pieza, aprobación del cliente..."></textarea>
+                <textarea id="rma-espera-text" rows="3" placeholder="Ej.: test extensivo, pieza, aprobación del cliente..."></textarea>
                 <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:12px;">
                     <button id="rma-espera-cancel-btn" class="inc-add-update-btn" style="background: var(--secondary-color);">Cancelar</button>
                     <button id="rma-espera-confirm-btn" class="inc-add-update-btn"><i class="fas fa-check"></i> Confirmar</button>
@@ -2483,8 +2477,6 @@ document.addEventListener('DOMContentLoaded', () => {
     const rmaInfoAddBtn      = document.getElementById('rma-info-add-btn');
     const rmaInfoGarantiaGBtn = document.getElementById('rma-info-garantia-g');
     const rmaInfoGarantiaFBtn = document.getElementById('rma-info-garantia-f');
-    const rmaInfoExtensivoRow   = document.getElementById('rma-info-extensivo-row');
-    const rmaInfoExtensivoCheck = document.getElementById('rma-info-extensivo-check');
     const rmaInfoEsperaRow      = document.getElementById('rma-info-espera-row');
     const rmaInfoEsperaCheck    = document.getElementById('rma-info-espera-check');
     const rmaInfoEsperaLabel    = document.getElementById('rma-info-espera-label');
@@ -2623,6 +2615,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
     let rmaTracking = [];        // array of { id, rma, fase, fecha, usuario, info: [{id, fecha, texto, usuario}] }
     const RMA_PHASES = ['Pendiente Recibir', 'Pretest', 'En espera', 'Repair', 'Final Test'];
+    /* Fases en las que se puede marcar "En espera de…" (motivo + cronómetro pausado) */
+    const RMA_ESPERA_PHASES = ['Pretest', 'Final Test'];
     let rmaHistorial = [];       // array of { id, rma, fase, usuario, fecha } — historial completo de movimientos
     let rmaInfoCurrentId  = null; // id del RMA cuya info está abierta en el modal
     let rmaInfoEditingId  = null; // id de la nota de info que se está editando
@@ -3816,12 +3810,12 @@ document.addEventListener('DOMContentLoaded', () => {
         if (entry.garantia !== 'G' && entry.garantia !== 'F') entry.garantia = null;
         if (!Array.isArray(entry.info)) entry.info = [];
         entry.info.forEach(n => { if (!n.id) n.id = genId('rmainfo'); });
-        if (typeof entry.testExtensivo !== 'boolean') entry.testExtensivo = false;
-        /* El check "Test Extensivo" solo tiene sentido en Pretest: si el RMA ya no está
-           en esa fase (p. ej. se restauró desde datos antiguos), se desmarca. */
-        if (entry.fase !== 'Pretest') entry.testExtensivo = false;
-        /* "En espera de…" (motivo) solo existe en Final Test */
-        if (typeof entry.esperaMotivo !== 'string' || !entry.esperaMotivo.trim() || entry.fase !== 'Final Test') entry.esperaMotivo = null;
+        /* Compatibilidad: el antiguo check "Test Extensivo" (solo Pretest) pasa a ser
+           "En espera de Test Extensivo", así el cronómetro pausado sigue teniendo motivo y casilla. */
+        if (entry.testExtensivo === true && entry.fase === 'Pretest' && !(typeof entry.esperaMotivo === 'string' && entry.esperaMotivo.trim())) entry.esperaMotivo = 'Test Extensivo';
+        delete entry.testExtensivo;
+        /* "En espera de…" (motivo) solo existe en Pretest y Final Test */
+        if (typeof entry.esperaMotivo !== 'string' || !entry.esperaMotivo.trim() || !RMA_ESPERA_PHASES.includes(entry.fase)) entry.esperaMotivo = null;
         if (!entry.cronometro || typeof entry.cronometro !== 'object') {
             /* RMAs ya existentes que no tenían cronómetro: se crea arrancado desde ahora
                (pausado si ya está "En espera" o todavía "Pendiente Recibir") */
@@ -3962,7 +3956,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!value) return;
         rmaTracking.push({
             id: genId('rma'), rma: value, fase: 'Pendiente Recibir', fecha: nowStr(), usuario: currentUserEmail,
-            info: [], testExtensivo: false, esperaMotivo: null, cronometro: { running: false, accumulatedMs: 0, startedAt: null }
+            info: [], esperaMotivo: null, cronometro: { running: false, accumulatedMs: 0, startedAt: null }
         });
         await saveRmaTracking();
         await addRmaHistorial(value, 'Pendiente Recibir', currentUserEmail);
@@ -4045,47 +4039,7 @@ document.addEventListener('DOMContentLoaded', () => {
         showNotification(valor === 'G' ? 'RMA marcado como en garantía' : 'RMA marcado como fuera de garantía');
     };
 
-    /* Check "Test Extensivo" (solo disponible en fase Pretest):
-       - Al marcarlo: pausa el cronómetro del RMA (se guarda el tiempo acumulado).
-       - Al desmarcarlo: reanuda el cronómetro (solo tiene efecto si sigue en Pretest).
-       - Si el RMA cambia de fase, se desmarca automáticamente (ver doRmaMovePhase) y el
-         cronómetro pasa a depender únicamente de la fase nueva. */
-    window.rmaInfoToggleTestExtensivo = async function() {
-        if (!rmaInfoCurrentId) return;
-        const idx = rmaFindIndex(rmaInfoCurrentId);
-        if (idx === -1) return;
-        const entry = rmaTracking[idx];
-        if (entry.fase !== 'Pretest') { renderRmaInfo(); return; }
-
-        if (!entry.cronometro || typeof entry.cronometro !== 'object') {
-            entry.cronometro = { running: false, accumulatedMs: 0, startedAt: null };
-        }
-        const c = entry.cronometro;
-        const activar = !entry.testExtensivo;
-        entry.testExtensivo = activar;
-
-        if (activar) {
-            /* Marcado: pausar el cronómetro */
-            if (c.running) {
-                c.accumulatedMs = rmaCronoElapsedMs(entry);
-                c.running = false;
-                c.startedAt = null;
-            }
-        } else {
-            /* Desmarcado: reanudar el cronómetro (sigue en Pretest) */
-            if (!c.running) {
-                c.running = true;
-                c.startedAt = Date.now();
-            }
-        }
-
-        await saveRmaTracking();
-        renderRmaTracking();
-        renderRmaInfo();
-        showNotification(activar ? 'Test Extensivo activado: cronómetro pausado' : 'Test Extensivo desactivado: cronómetro reanudado');
-    };
-
-    /* Check "En espera de…" (solo en fase Final Test):
+    /* Check "En espera de…" (fases Pretest y Final Test):
        - Al marcarlo se pide el motivo (obligatorio) y se pausa el cronómetro.
        - Al desmarcarlo el cronómetro continúa donde se quedó.
        - Si el RMA cambia de fase se quita solo (ver doRmaMovePhase). */
@@ -4094,7 +4048,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const idx = rmaFindIndex(rmaInfoCurrentId);
         if (idx === -1) return;
         const entry = rmaTracking[idx];
-        if (entry.fase !== 'Final Test') { renderRmaInfo(); return; }
+        if (!RMA_ESPERA_PHASES.includes(entry.fase)) { renderRmaInfo(); return; }
 
         if (!entry.esperaMotivo) {
             /* Marcar: primero se pide el motivo; hasta confirmar no cambia nada */
@@ -4140,7 +4094,7 @@ document.addEventListener('DOMContentLoaded', () => {
         rmaEsperaTextEl.value = '';
         if (idx === -1) return;
         const entry = rmaTracking[idx];
-        if (entry.fase !== 'Final Test') { if (rmaInfoCurrentId) renderRmaInfo(); return; }
+        if (!RMA_ESPERA_PHASES.includes(entry.fase)) { if (rmaInfoCurrentId) renderRmaInfo(); return; }
         entry.esperaMotivo = motivo;
         if (!Array.isArray(entry.info)) entry.info = [];
         entry.info.push({ id: genId('rmainfo'), fecha: todayISO(), texto: `En espera de: ${motivo}. Cronómetro pausado.`, usuario: currentUserEmail });
@@ -4183,12 +4137,9 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         }
 
-        /* Al cambiar de fase se quita automáticamente el check "Test Extensivo": ese check
-           solo aplica mientras el RMA está en Pretest. El cronómetro pasa a depender
-           únicamente de la nueva fase (bloque siguiente). */
-        rmaTracking[idx].testExtensivo = false;
-        /* "En espera de…" solo aplica en Final Test: si al cambiar de fase seguía activo,
-           se quita y queda registrado en Info */
+        /* "En espera de…" solo aplica dentro de la fase en la que se marcó: si al cambiar de fase
+           seguía activo, se quita (queda registrado en Info) y el cronómetro continúa según la
+           nueva fase (bloque siguiente). */
         if (rmaTracking[idx].esperaMotivo) {
             if (!Array.isArray(rmaTracking[idx].info)) rmaTracking[idx].info = [];
             rmaTracking[idx].info.push({ id: genId('rmainfo'), fecha: todayISO(), texto: `Deja de estar en espera de: ${rmaTracking[idx].esperaMotivo} (cambio de fase a "${newPhase}").`, usuario: currentUserEmail });
@@ -4348,15 +4299,12 @@ document.addEventListener('DOMContentLoaded', () => {
                 <i class="fas fa-circle-info"></i> Info${infoCount ? `<span class="rma-info-count">${infoCount}</span>` : ''}
             </button>`;
         const isRunning = !!(entry.cronometro && entry.cronometro.running);
-        const extensivoBadge = (entry.fase === 'Pretest' && entry.testExtensivo)
-            ? ' <span title="Test Extensivo activo (cronómetro pausado)" style="font-size:0.68rem; font-weight:700; color:var(--secondary-color);"><i class="fas fa-pause"></i> Test Extensivo</span>'
-            : '';
         const cronoHtml = `
             <div class="rma-card-crono">
                 <i class="fas fa-stopwatch"></i>
-                <span class="rma-crono-time${isRunning ? '' : ' paused'}" data-id="${entry.id}">${esc(rmaCronoFormat(rmaCronoElapsedMs(entry)))}</span>${extensivoBadge}
+                <span class="rma-crono-time${isRunning ? '' : ' paused'}" data-id="${entry.id}">${esc(rmaCronoFormat(rmaCronoElapsedMs(entry)))}</span>
             </div>`;
-        const esperaHtml = (entry.fase === 'Final Test' && entry.esperaMotivo)
+        const esperaHtml = (RMA_ESPERA_PHASES.includes(entry.fase) && entry.esperaMotivo)
             ? `<div class="rma-card-espera" title="En espera de ${esc(entry.esperaMotivo)}"><i class="fas fa-pause"></i> En espera de ${esc(entry.esperaMotivo)}</div>`
             : '';
         const garantiaDot = entry.garantia === 'G'
@@ -4447,17 +4395,8 @@ document.addEventListener('DOMContentLoaded', () => {
         rmaInfoGarantiaGBtn.classList.toggle('active-g', entry.garantia === 'G');
         rmaInfoGarantiaFBtn.classList.toggle('active-f', entry.garantia === 'F');
 
-        /* El check "Test Extensivo" solo se muestra mientras el RMA está en Pretest */
-        if (entry.fase === 'Pretest') {
-            rmaInfoExtensivoRow.style.display = 'block';
-            rmaInfoExtensivoCheck.checked = !!entry.testExtensivo;
-        } else {
-            rmaInfoExtensivoRow.style.display = 'none';
-            rmaInfoExtensivoCheck.checked = false;
-        }
-
-        /* El check "En espera de…" solo se muestra mientras el RMA está en Final Test */
-        if (entry.fase === 'Final Test') {
+        /* El check "En espera de…" solo se muestra mientras el RMA está en Pretest o Final Test */
+        if (RMA_ESPERA_PHASES.includes(entry.fase)) {
             rmaInfoEsperaRow.style.display = 'block';
             rmaInfoEsperaCheck.checked = !!entry.esperaMotivo;
             rmaInfoEsperaLabel.innerHTML = entry.esperaMotivo
