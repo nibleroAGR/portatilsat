@@ -37,7 +37,6 @@
             color: white;
             transition: opacity 0.2s;
         }
-        .btn-inventory-nav { background-color: #2c3e50; }
         .btn-nav:hover { opacity: 0.9; }
 
         p.subtitle {
@@ -280,7 +279,6 @@
             <label for="parts-file-input" class="custom-file-upload btn-parts-load">🛠️ Cargar Piezas (KBO)</label>
             <input type="file" id="parts-file-input" accept=".xlsx, .xls, .csv" />
             
-            <button class="btn-nav btn-inventory-nav" onclick="openInventoryModal()">📦 Inventario</button>
         </div>
     </div>
     
@@ -342,6 +340,11 @@
                 <label class="action-btn" style="background-color: #34495e; color: white; cursor: pointer; display: inline-block; padding: 6px 12px; border-radius: 4px; font-weight: bold; font-size: 0.85em; text-align: center;">
                     📥 Importar Respaldo
                     <input type="file" id="import-inv-file" accept=".json" onchange="importInventoryBackup(event)">
+                </label>
+                <button class="action-btn" style="background-color: #27ae60; color: white;" onclick="exportInventoryExcel()">📊 Exportar Excel</button>
+                <label class="action-btn" style="background-color: #16a085; color: white; cursor: pointer; display: inline-block; padding: 6px 12px; border-radius: 4px; font-weight: bold; font-size: 0.85em; text-align: center;">
+                    📊 Importar Excel
+                    <input type="file" id="import-inv-excel" accept=".xlsx, .xls, .csv" onchange="importInventoryExcel(event)">
                 </label>
                 <button class="action-btn" style="background-color: #2c3e50; color: white;" onclick="printInventoryFilteredList()">𖨾 Imprimir Inventario</button>
             </div>
@@ -875,6 +878,52 @@
             dlAnchor.setAttribute("href", dataStr);
             dlAnchor.setAttribute("download", `backup_inventario.json`);
             dlAnchor.click();
+        };
+
+        window.exportInventoryExcel = function() {
+            const keys = Object.keys(localInventoryData).sort();
+            if (keys.length === 0) return alert("No hay datos en el inventario para exportar.");
+            const rows = keys.map(k => ({ 'Org PN': localInventoryData[k].pn, 'Ubicación': localInventoryData[k].location || '' }));
+            const ws = XLSX.utils.json_to_sheet(rows, { header: ['Org PN', 'Ubicación'] });
+            ws['!cols'] = [{ wch: 24 }, { wch: 28 }];
+            const wb = XLSX.utils.book_new();
+            XLSX.utils.book_append_sheet(wb, ws, 'Inventario');
+            const fecha = new Date().toISOString().slice(0, 10);
+            XLSX.writeFile(wb, `inventario_${fecha}.xlsx`);
+        };
+
+        window.importInventoryExcel = function(event) {
+            const input = event.target;
+            const file = input.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = async function(e) {
+                try {
+                    const workbook = XLSX.read(new Uint8Array(e.target.result), { type: 'array' });
+                    const rows = XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]], { defval: "" });
+                    const pick = (row, names) => {
+                        const key = Object.keys(row).find(k => names.includes(k.trim().toLowerCase()));
+                        return key !== undefined ? String(row[key]).trim() : '';
+                    };
+                    const items = new Map();
+                    let skipped = 0;
+                    rows.forEach(row => {
+                        const pn = pick(row, ['org pn', 'org_pn', 'orgpn', 'pn', 'número de pieza', 'numero de pieza']);
+                        const location = pick(row, ['ubicación', 'ubicacion', 'location']);
+                        if (!pn || pn.includes('/')) { if (pn || location) skipped++; return; }
+                        items.set(pn, location);
+                    });
+                    if (items.size === 0) return alert("No se encontraron filas válidas. El Excel debe tener las columnas 'Org PN' y 'Ubicación'.");
+                    if (!confirm(`Se van a importar ${items.size} piezas al inventario.\nLas que ya existan se actualizarán con la ubicación del Excel.\n\n¿Continuar?`)) return;
+                    await Promise.all([...items].map(([pn, location]) => setDoc(doc(db, "inventory_items", pn), { pn: pn, location: location }, { merge: true })));
+                    alert(`✓ Excel importado: ${items.size} piezas.` + (skipped ? `\n⚠️ Se omitieron ${skipped} fila(s) sin Org PN válido.` : ''));
+                } catch (error) {
+                    console.error(error);
+                    alert("No se pudo leer el archivo. Comprueba que es un Excel o CSV válido.");
+                }
+            };
+            reader.readAsArrayBuffer(file);
+            input.value = '';
         };
 
         window.importInventoryBackup = function(event) {
