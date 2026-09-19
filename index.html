@@ -4236,7 +4236,13 @@ document.addEventListener('DOMContentLoaded', () => {
            solo aplica mientras el RMA está en Pretest. El cronómetro pasa a depender
            únicamente de la nueva fase (bloque siguiente). */
         rmaTracking[idx].testExtensivo = false;
-        rmaTracking[idx].esperaMotivo = null;   /* "En espera de…" solo aplica en Final Test */
+        /* "En espera de…" solo aplica en Final Test: si al cambiar de fase seguía activo,
+           se quita y queda registrado en Info */
+        if (rmaTracking[idx].esperaMotivo) {
+            if (!Array.isArray(rmaTracking[idx].info)) rmaTracking[idx].info = [];
+            rmaTracking[idx].info.push({ id: genId('rmainfo'), fecha: todayISO(), texto: `Deja de estar en espera de: ${rmaTracking[idx].esperaMotivo} (cambio de fase a "${newPhase}").`, usuario: currentUserEmail });
+        }
+        rmaTracking[idx].esperaMotivo = null;
 
         /* Cronómetro automático según fase: en "En espera" se pausa, en el resto continúa/se reanuda */
         const entry = rmaTracking[idx];
