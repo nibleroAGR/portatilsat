@@ -1349,29 +1349,6 @@
         .rma-historial-user { color: var(--text-color); flex: 1; min-width: 160px; }
         .rma-historial-fecha { color: var(--secondary-color); font-size: 0.78rem; white-space: nowrap; }
 
-        /* Badge de novedades sobre el icono de actualizar */
-        .rma-updates-badge {
-            position: absolute; top: -4px; right: -4px;
-            background: var(--danger-color, #dc3545); color: #fff;
-            font-size: 0.6rem; font-weight: 700; line-height: 1;
-            padding: 3px 5px; border-radius: 50%;
-            min-width: 8px; text-align: center;
-        }
-
-        /* Modal de novedades del programa */
-        #rma-updates-modal-overlay .modal-box { max-width: 700px; }
-        .rma-updates-list { display: flex; flex-direction: column; gap: 14px; }
-        .rma-update-item {
-            border-left: 3px solid var(--primary-color);
-            padding: 6px 0 6px 14px;
-        }
-        .rma-update-date {
-            font-size: 0.78rem; font-weight: 700; color: var(--primary-color);
-            display: flex; align-items: center; gap: 6px; margin-bottom: 4px;
-        }
-        .rma-update-item ul { margin: 0; padding-left: 18px; }
-        .rma-update-item li { color: var(--text-color); font-size: 0.9rem; margin-bottom: 2px; }
-
         /* ══════════════════════════════════════════
            CONFIGURACIÓN GENERAL
         ══════════════════════════════════════════ */
@@ -1903,10 +1880,6 @@
                     <button id="rma-stats-btn" class="modal-close-btn" title="Estadísticas (solo administrador)" style="font-size:1rem;"><i class="fas fa-chart-line"></i></button>
                     <button id="rma-accounting-btn" class="modal-close-btn" title="Contabilidad (solo administrador)" style="font-size:1rem;"><i class="fas fa-file-invoice-dollar"></i></button>
                     <button id="rma-history-btn" class="modal-close-btn" title="Historial de fases" style="font-size:1rem;"><i class="fas fa-history"></i></button>
-                    <button id="rma-updates-btn" class="modal-close-btn" title="Novedades del programa" style="font-size:1rem; position:relative;">
-                        <i class="fas fa-arrows-rotate"></i>
-                        <span id="rma-updates-badge" class="rma-updates-badge" style="display:none;"></span>
-                    </button>
                     <button id="rma-close-btn" class="modal-close-btn" title="Cerrar"><i class="fas fa-times"></i></button>
                 </div>
             </div>
@@ -2077,22 +2050,6 @@
                 </div>
                 <div id="rma-historial-empty" class="inc-empty">No hay movimientos registrados todavía.</div>
                 <div id="rma-historial-list" class="rma-historial-list"></div>
-            </div>
-        </div>
-    </div>
-
-    <!-- ══════════════════════════════════════════
-         NOVEDADES DEL PROGRAMA
-    ══════════════════════════════════════════ -->
-    <div id="rma-updates-modal-overlay" class="modal-overlay">
-        <div class="modal-box">
-            <div class="modal-header">
-                <h2><i class="fas fa-arrows-rotate"></i> Novedades del programa</h2>
-                <button id="rma-updates-close-btn" class="modal-close-btn" title="Cerrar"><i class="fas fa-times"></i></button>
-            </div>
-            <div class="modal-body">
-                <div id="rma-updates-empty" class="inc-empty" style="display:none;">No hay novedades registradas todavía.</div>
-                <div id="rma-updates-list" class="rma-updates-list"></div>
             </div>
         </div>
     </div>
@@ -2514,12 +2471,6 @@ document.addEventListener('DOMContentLoaded', () => {
     const rmaHistCloseBtn    = document.getElementById('rma-historial-close-btn');
     const rmaHistSearchInput = document.getElementById('rma-historial-search');
 
-    const rmaUpdatesBtn        = document.getElementById('rma-updates-btn');
-    const rmaUpdatesBadge      = document.getElementById('rma-updates-badge');
-    const rmaUpdatesModalOverlay = document.getElementById('rma-updates-modal-overlay');
-    const rmaUpdatesCloseBtn   = document.getElementById('rma-updates-close-btn');
-    const rmaUpdatesList       = document.getElementById('rma-updates-list');
-    const rmaUpdatesEmpty      = document.getElementById('rma-updates-empty');
 
     const rmaInfoModalOverlay = document.getElementById('rma-info-modal-overlay');
     const rmaInfoCloseBtn    = document.getElementById('rma-info-close-btn');
@@ -4630,58 +4581,6 @@ document.addEventListener('DOMContentLoaded', () => {
         showNotification(`RMA ${value} añadido a Pretest`);
     });
     rmaNewInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') rmaAddBtn.click(); });
-
-    /* ── Novedades del programa ──
-       Registro de cambios realizados en la aplicación. Cada vez que se añada
-       una mejora o corrección, se debe agregar una nueva entrada aquí con la
-       fecha correspondiente (formato AAAA-MM-DD). Se muestran siempre
-       ordenadas de la más reciente a la más antigua. */
-    const RMA_CHANGELOG = [
-        {
-            fecha: '2026-09-09',
-            cambios: [
-                'Al borrar un registro en Panel de Transporte, si ese RMA sigue en "Pendiente Recibir" en Seguimiento RMA, ahora se pregunta si también se quiere eliminar de ahí.',
-                'Añadido el icono de "Novedades del programa" en Seguimiento RMA, con historial de cambios ordenado por fecha más reciente.'
-            ]
-        }
-        // Añadir aquí las próximas entradas, por ejemplo:
-        // { fecha: '2026-09-15', cambios: ['Descripción del cambio 1', 'Descripción del cambio 2'] }
-    ];
-
-    function renderRmaUpdates() {
-        const items = RMA_CHANGELOG.slice().sort((a, b) => (a.fecha < b.fecha ? 1 : -1));
-        if (!items.length) {
-            rmaUpdatesEmpty.style.display = 'block';
-            rmaUpdatesList.innerHTML = '';
-            return;
-        }
-        rmaUpdatesEmpty.style.display = 'none';
-        rmaUpdatesList.innerHTML = items.map(entry => `
-            <div class="rma-update-item">
-                <div class="rma-update-date"><i class="fas fa-calendar-day"></i> ${esc(entry.fecha)}</div>
-                <ul>${(entry.cambios || []).map(c => `<li>${esc(c)}</li>`).join('')}</ul>
-            </div>`).join('');
-    }
-
-    function updateRmaUpdatesBadge() {
-        if (!RMA_CHANGELOG.length) { rmaUpdatesBadge.style.display = 'none'; return; }
-        const latest = RMA_CHANGELOG.slice().sort((a, b) => (a.fecha < b.fecha ? 1 : -1))[0].fecha;
-        const lastSeen = localStorage.getItem('rmaUpdatesLastSeen') || '';
-        rmaUpdatesBadge.style.display = (latest > lastSeen) ? 'block' : 'none';
-    }
-
-    rmaUpdatesBtn.addEventListener('click', () => {
-        rmaUpdatesModalOverlay.classList.add('show');
-        renderRmaUpdates();
-        const latest = RMA_CHANGELOG.slice().sort((a, b) => (a.fecha < b.fecha ? 1 : -1))[0];
-        if (latest) localStorage.setItem('rmaUpdatesLastSeen', latest.fecha);
-        rmaUpdatesBadge.style.display = 'none';
-    });
-    rmaUpdatesCloseBtn.addEventListener('click', () => rmaUpdatesModalOverlay.classList.remove('show'));
-    rmaUpdatesModalOverlay.addEventListener('click', (e) => { if (e.target === rmaUpdatesModalOverlay) rmaUpdatesModalOverlay.classList.remove('show'); });
-    document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && rmaUpdatesModalOverlay.classList.contains('show')) rmaUpdatesModalOverlay.classList.remove('show'); });
-
-    updateRmaUpdatesBadge();
 
     /* ── Historial de fases RMA ── */
     function renderRmaHistorial() {
