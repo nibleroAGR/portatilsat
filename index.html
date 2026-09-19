@@ -1334,6 +1334,9 @@
         body.restricted-mode #rma-stats-btn { display: none; }
         body.restricted-mode #rma-accounting-btn { display: none; }
 
+        /* ── Funciones exclusivas del usuario Master (cambiar clave de cifrado, importar/exportar datos) ── */
+        body.not-master .master-only { display: none !important; }
+
         /* ══════════════════════════════════════════
            HISTORIAL DE SEGUIMIENTO RMA
         ══════════════════════════════════════════ */
@@ -1611,7 +1614,7 @@
     @media (max-width: 700px) { #inv-modal-overlay .inv-grid { grid-template-columns: 1fr; } }
 </style>
 </head>
-<body>
+<body class="not-master">
 
 <!-- ── PANTALLA DE CLAVE DE CIFRADO ── -->
 <div id="crypto-screen">
@@ -2095,12 +2098,12 @@
                     </div>
                 </div>
                 <div class="inv-panel">
-                    <button class="inv-btn inv-json" id="inv-export-json-btn">📤 Exportar Respaldo (JSON)</button>
-                    <label class="inv-btn inv-imp-json">📥 Importar Respaldo
+                    <button class="inv-btn inv-json master-only" id="inv-export-json-btn">📤 Exportar Respaldo (JSON)</button>
+                    <label class="inv-btn inv-imp-json master-only">📥 Importar Respaldo
                         <input type="file" id="inv-import-json" accept=".json">
                     </label>
-                    <button class="inv-btn inv-xls" id="inv-export-xls-btn">📊 Exportar Excel</button>
-                    <label class="inv-btn inv-imp-xls">📊 Importar Excel
+                    <button class="inv-btn inv-xls master-only" id="inv-export-xls-btn">📊 Exportar Excel</button>
+                    <label class="inv-btn inv-imp-xls master-only">📊 Importar Excel
                         <input type="file" id="inv-import-xls" accept=".xlsx, .xls, .csv">
                     </label>
                     <button class="inv-btn inv-print" id="inv-print-btn">🖨️ Imprimir Inventario</button>
@@ -2154,10 +2157,10 @@
                     <h3 class="settings-backup-title"><i class="fas fa-shield-alt"></i> Cifrado de datos</h3>
                     <p class="settings-backup-desc">Todos los datos se guardan cifrados en Firebase (AES-256-GCM) con la clave de cifrado; solo quien la conoce puede leerlos. Si se pierde la clave, los datos no se pueden recuperar.</p>
                     <div class="settings-backup-actions">
-                        <button id="settings-change-key-btn" class="rma-add-btn"><i class="fas fa-key"></i> Cambiar la clave de cifrado</button>
+                        <button id="settings-change-key-btn" class="rma-add-btn master-only"><i class="fas fa-key"></i> Cambiar la clave de cifrado</button>
                         <button id="settings-forget-key-btn" class="rma-add-btn" style="background:var(--secondary-color);"><i class="fas fa-eraser"></i> Olvidar la clave en este equipo</button>
                     </div>
-                    <div id="settings-keychange-form" class="settings-add-form settings-keychange-form">
+                    <div id="settings-keychange-form" class="settings-add-form settings-keychange-form master-only">
                         <div class="settings-keychange-warn"><i class="fas fa-exclamation-triangle"></i> Todos los datos se volverán a cifrar con la clave nueva. Asegúrate de que nadie más esté usando la aplicación: las demás sesiones abiertas se cerrarán y tendrán que iniciar sesión con la clave nueva. Si pierdes la clave nueva, los datos no se podrán recuperar.</div>
                         <input type="password" id="settings-key-current" placeholder="Clave de cifrado actual" autocomplete="off">
                         <input type="password" id="settings-key-new" placeholder="Clave nueva (mín. 10 caracteres)" autocomplete="off">
@@ -2171,7 +2174,7 @@
                     <div id="settings-crypto-status" class="settings-backup-status"></div>
                 </div>
 
-                <div class="settings-backup-section">
+                <div class="settings-backup-section master-only">
                     <h3 class="settings-backup-title"><i class="fas fa-database"></i> Copia de seguridad de todos los datos</h3>
                     <p class="settings-backup-desc">Exporta todos los datos de la aplicación (recogidas, transporte, incidencias, seguimiento y contabilidad RMA, usuarios y delegaciones) a un archivo Excel, o restáuralos a partir de un archivo exportado anteriormente. Ojo: el archivo Excel exportado NO está cifrado, guárdalo en un lugar seguro.</p>
                     <div class="settings-backup-actions">
@@ -2623,10 +2626,14 @@ document.addEventListener('DOMContentLoaded', () => {
     let rmaInfoCurrentId  = null; // id del RMA cuya info está abierta en el modal
     let rmaInfoEditingId  = null; // id de la nota de info que se está editando
 
-    const ADMIN_EMAIL = 'agamarra@megasur.es';
-    let isAdmin = false;
+    /* Roles: 'master' (único: este correo; acceso completo + cambiar la clave de cifrado + importar/exportar datos),
+       'admin' (acceso completo, sin lo anterior) y 'tecnico' (solo Seguimiento RMA). */
+    const MASTER_EMAIL = 'agamarra@megasur.es';
+    let isMaster = false;
+    window._isMaster = () => isMaster;
+    let isAdmin = false;   // true para Master y para Administrador
     let currentUserEmail = '';
-    let userRoles = [];   // array de { email, role: 'admin' | 'tecnico' } — usuarios creados por el admin
+    let userRoles = [];   // array de { email, role: 'admin' | 'tecnico' } — usuarios creados por el admin (el Master no está en la lista)
     let settingsEditingIdx = null; // índice del usuario cuya contraseña se está editando (o null)
 
     /* ════════════════════════════════════════
@@ -5336,9 +5343,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function getRoleForEmail(email) {
         const e = (email || '').toLowerCase();
-        if (e === ADMIN_EMAIL) return 'admin';
+        if (e === MASTER_EMAIL) return 'master';
         const found = userRoles.find(u => (u.email || '').toLowerCase() === e);
-        return found ? found.role : 'tecnico';
+        return (found && found.role === 'admin') ? 'admin' : 'tecnico';
     }
 
     function renderSettingsUsers() {
@@ -5648,7 +5655,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
         if (!email || !password) { settingsError.textContent = 'Introduce correo y contraseña'; return; }
         if (password.length < 6) { settingsError.textContent = 'La contraseña debe tener al menos 6 caracteres'; return; }
-        if (email.toLowerCase() === ADMIN_EMAIL) { settingsError.textContent = 'Ese correo ya es el del administrador principal'; return; }
+        if (email.toLowerCase() === MASTER_EMAIL) { settingsError.textContent = 'Ese correo ya es el del usuario Master'; return; }
         if (!window._fbCreateUserSecondary) { settingsError.textContent = 'Conectando con el servidor, inténtalo de nuevo en unos segundos'; return; }
 
         settingsCreateBtn.disabled = true;
@@ -5700,6 +5707,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     async function exportAllDataBackup() {
+        if (!isMaster) { setBackupStatus('Solo el usuario Master puede exportar datos.', 'error'); return; }
         setBackupStatus('Generando copia de seguridad...', '');
         settingsExportBtn.disabled = true;
         settingsImportBtn.disabled = true;
@@ -5743,6 +5751,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     async function importAllDataBackup(file) {
         if (!file) return;
+        if (!isMaster) { setBackupStatus('Solo el usuario Master puede importar datos.', 'error'); settingsImportFile.value = ''; return; }
         const confirmed = confirm('Esto reemplazará TODOS los datos actuales de la aplicación (recogidas, transporte, incidencias, seguimiento y contabilidad RMA, usuarios y delegaciones) por los del archivo seleccionado.\n\nEsta acción no se puede deshacer. ¿Deseas continuar?');
         if (!confirmed) { settingsImportFile.value = ''; return; }
 
@@ -5871,7 +5880,7 @@ document.addEventListener('DOMContentLoaded', () => {
             if (await window._fbCryptoTryRemembered()) { finishCrypto(true); return; }
             showCryptoScreen('unlock');
         } else {
-            showCryptoScreen(currentUserEmail.toLowerCase() === ADMIN_EMAIL ? 'setup' : 'wait');
+            showCryptoScreen(currentUserEmail.toLowerCase() === MASTER_EMAIL ? 'setup' : 'wait');
         }
     }
 
@@ -5957,7 +5966,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     changeKeyBtn.addEventListener('click', () => {
-        if (!isAdmin) return;
+        if (!isMaster) return;
         setCryptoStatus('');
         keyRememberCheck.checked = !!(window._fbCryptoRemembered && window._fbCryptoRemembered());
         keyChangeForm.classList.toggle('show');
@@ -5966,7 +5975,7 @@ document.addEventListener('DOMContentLoaded', () => {
     keyCancelBtn.addEventListener('click', () => { if (!keyChangeBusy) { resetKeyChangeForm(); setCryptoStatus(''); } });
 
     keyConfirmBtn.addEventListener('click', async () => {
-        if (keyChangeBusy || !isAdmin) return;
+        if (keyChangeBusy || !isMaster) return;
         const cur = keyCurrentInput.value, nw = keyNewInput.value, nw2 = keyNew2Input.value;
         if (!cur || !nw || !nw2) { setCryptoStatus('Rellena los tres campos', 'error'); return; }
         if (nw.length < 10) { setCryptoStatus('La clave nueva debe tener al menos 10 caracteres', 'error'); return; }
@@ -6033,13 +6042,16 @@ document.addEventListener('DOMContentLoaded', () => {
             if (!unlocked) return;
             startDataSync();
             await loadUserRoles();
-            isAdmin = getRoleForEmail(currentUserEmail) === 'admin';
+            const role = getRoleForEmail(currentUserEmail);
+            isMaster = role === 'master';
+            isAdmin  = isMaster || role === 'admin';
 
             loginScreen.style.display = 'none';
             mainContainerEl.style.display = 'block';
             userBar.style.display = 'flex';
-            userBarEmail.textContent = currentUserEmail + (isAdmin ? ' (Administrador)' : ' (Técnico)');
+            userBarEmail.textContent = currentUserEmail + (isMaster ? ' (Master)' : isAdmin ? ' (Administrador)' : ' (Técnico)');
             document.body.classList.toggle('restricted-mode', !isAdmin);
+            document.body.classList.toggle('not-master', !isMaster);
 
             loginError.textContent = '';
             loginEmailInput.value = '';
@@ -6052,6 +6064,8 @@ document.addEventListener('DOMContentLoaded', () => {
         } else {
             currentUserEmail = '';
             isAdmin = false;
+            isMaster = false;
+            document.body.classList.add('not-master');
             if (cryptoResolve) finishCrypto(false);
             cryptoScreen.style.display = 'none';
             stopDataSync();
@@ -6078,7 +6092,7 @@ document.addEventListener('DOMContentLoaded', () => {
             /* Bootstrap: la primera vez que el administrador principal inicia sesión, su cuenta
                todavía no existe en Firebase Auth. La creamos automáticamente. El resto de usuarios
                son dados de alta por el administrador desde Configuración, así que aquí no se crean. */
-            if (email.toLowerCase() === ADMIN_EMAIL) {
+            if (email.toLowerCase() === MASTER_EMAIL) {
                 try {
                     await window._fbSignUp(email, password);
                 } catch (err2) {
@@ -6134,6 +6148,11 @@ document.addEventListener('DOMContentLoaded', () => {
     const setSync = (msg, color) => { const el = $('inv-sync-status'); if (el) { el.textContent = msg; el.style.color = color || '#555'; } };
     const cryptoOk = () => !!(window._fbCryptoReady && window._fbCryptoReady()
         && window._fbGetInventario && window._fbSetInventario && window._fbListenInventario);
+    const masterOnly = (what) => {
+        if (window._isMaster && window._isMaster()) return true;
+        alert('Solo el usuario Master puede ' + what + '.');
+        return false;
+    };
     const byPn = (a, b) => a.pn < b.pn ? -1 : a.pn > b.pn ? 1 : 0;
 
     function applyRows(rows) {
@@ -6246,6 +6265,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function exportJson() {
+        if (!masterOnly('exportar datos')) return;
         const dataStr = 'data:text/json;charset=utf-8,' + encodeURIComponent(JSON.stringify(invData, null, 2));
         const a = document.createElement('a');
         a.setAttribute('href', dataStr);
@@ -6254,6 +6274,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function exportExcel() {
+        if (!masterOnly('exportar datos')) return;
         const keys = Object.keys(invData).sort();
         if (keys.length === 0) return alert('No hay datos en el inventario para exportar.');
         const rows = keys.map(k => ({ 'Org PN': pnOf(k), 'Ubicación': invData[k].location || '' }));
@@ -6266,6 +6287,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function importExcel(event) {
         const input = event.target;
+        if (!masterOnly('importar datos')) { input.value = ''; return; }
         const file = input.files[0];
         if (!file) return;
         const reader = new FileReader();
@@ -6300,6 +6322,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function importJson(event) {
         const input = event.target;
+        if (!masterOnly('importar datos')) { input.value = ''; return; }
         const file = input.files[0];
         if (!file) return;
         const reader = new FileReader();
